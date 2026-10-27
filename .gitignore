@@ -1,0 +1,15 @@
+# Compiled binaries
+/hellhound
+/testserver/testserver
+
+# Go build/test artifacts
+*.test
+*.out
+*.prof
+
+# Local scratch files not meant for the repo
+preview.html
+
+# OS/editor noise
+.DS_Store
+*.swp
