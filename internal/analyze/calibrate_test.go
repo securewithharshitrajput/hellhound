@@ -184,3 +184,21 @@ func TestClusterFindingsDoesNotMergeDifferentStatusCodes(t *testing.T) {
 		}
 	}
 }
+
+// TestRandomTokenVariesAcrossCalls is a sanity check on Go's auto-seeded
+// global math/rand source (Go 1.20+ seeds it randomly at process start by
+// default, unlike earlier versions which needed an explicit rand.Seed()
+// call or produced the same deterministic sequence every run). Calibration
+// tokens being predictable/repeating would be a real problem — a target
+// could special-case the exact probe paths, defeating calibration — so
+// this confirms the assumption directly rather than trusting it silently.
+func TestRandomTokenVariesAcrossCalls(t *testing.T) {
+	seen := make(map[string]bool)
+	for i := 0; i < 20; i++ {
+		tok := RandomToken()
+		if seen[tok] {
+			t.Fatalf("RandomToken produced a duplicate on call %d: %q — tokens should not repeat within a run", i, tok)
+		}
+		seen[tok] = true
+	}
+}

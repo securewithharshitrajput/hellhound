@@ -361,6 +361,46 @@ func TestCloseReleasesIdleConnectionGoroutines(t *testing.T) {
 	}
 }
 
+// TestSlowTrickleBodyStillRespectsTimeout covers a case distinct from the
+// "server never responds at all" scenario: a target that sends headers
+// and starts the body promptly, then stalls mid-stream (deliberately, or
+// a genuinely slow backend) for longer than the configured timeout.
+// Go's docs state http.Client.Timeout covers reading the response body,
+// not just connecting and getting headers — this confirms that directly
+// rather than trusting the documentation, since a timeout that only
+// covered headers would let a slowloris-style target hang a worker
+// indefinitely once past the header line.
+func TestSlowTrickleBodyStillRespectsTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("partial-body-then-stall"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Stall well past the configured client timeout before (if ever)
+		// sending the rest. The handler goroutine leaking past the test is
+		// fine — httptest.Server doesn't wait for in-flight handlers on Close.
+		time.Sleep(5 * time.Second)
+		w.Write([]byte("-rest-of-body"))
+	}))
+	defer srv.Close()
+
+	cfg := testConfig()
+	cfg.Timeout = 1 * time.Second
+	e := New(cfg)
+
+	start := time.Now()
+	resp := e.Do(context.Background(), Request{Method: "GET", URL: srv.URL})
+	elapsed := time.Since(start)
+
+	if resp.Err == nil {
+		t.Errorf("expected a timeout error reading a stalled body, got success with body %q", resp.Body)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("took %s to time out on a stalled body — want close to the 1s configured timeout, not waiting for the 5s stall", elapsed)
+	}
+	t.Logf("fetch itself took %s (the test's own ~5s total wall time below is httptest.Server.Close() waiting for the slow handler goroutine to finish, not this fetch)", elapsed)
+}
+
 func TestTruncationDetection(t *testing.T) {
 	bigBody := strings.Repeat("x", 1000)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

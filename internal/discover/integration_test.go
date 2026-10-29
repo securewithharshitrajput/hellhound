@@ -199,6 +199,78 @@ func TestAllCalibrationProbesFailingWarnsLoudly(t *testing.T) {
 	}
 }
 
+// TestPerDirectoryCalibrationAdaptsToDifferentTemplates is a core
+// architectural claim that had never been directly tested: a real
+// multi-tier app commonly has a totally different "not found" shape per
+// section — an HTML 404 page on the static frontend, a JSON {"error":
+// "not found"} on the API backend. Calibration happens once PER
+// directory (a fresh Learn() call inside each scanDir), not once
+// globally, so each section's noise should be filtered using ITS OWN
+// baseline rather than whichever was learned first. This verifies both
+// halves: genuine hits are found in each section, and section-appropriate
+// noise is filtered in each section, including noise that is
+// structurally similar to the OTHER section's real content (JSON-shaped
+// noise under /api/ versus a JSON-shaped real hit also under /api/).
+func TestPerDirectoryCalibrationAdaptsToDifferentTemplates(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api":
+			w.Write([]byte("<html><body>API index</body></html>"))
+		case r.URL.Path == "/api/users":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"users": [{"id": 1, "name": "alice"}, {"id": 2, "name": "bob"}]}`))
+		case strings.HasPrefix(r.URL.Path, "/api/"):
+			// JSON-shaped soft-404 under the API section.
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"error": "not found", "path": "` + r.URL.Path + `"}`))
+		case r.URL.Path == "/admin":
+			w.Write([]byte("<html><body><h1>Admin Panel</h1></body></html>"))
+		default:
+			// HTML-shaped soft-404 under the root section.
+			w.Write([]byte("<html><body><h1>404</h1><p>Page " + r.URL.Path + " was not found on this server.</p></body></html>"))
+		}
+	}))
+	defer srv.Close()
+
+	d := New(testEngine(), Options{
+		BaseURL:      srv.URL,
+		Wordlist:     []string{"admin", "api", "users", "fakeword1", "fakeword2"},
+		CalibrationN: 6,
+		MaxDepth:     1, // allow recursion into /api so it gets its own calibration pass
+	})
+	results, err := d.Run(context.Background(), "/")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	found := map[string]bool{}
+	for _, r := range results {
+		found[r.URL] = true
+	}
+
+	mustFind := []string{"/admin", "/api", "/api/users"}
+	for _, want := range mustFind {
+		if !found[srv.URL+want] {
+			t.Errorf("expected to find %s, results: %+v", want, resultURLs(results))
+		}
+	}
+
+	mustNotFind := []string{"/fakeword1", "/fakeword2", "/api/fakeword1", "/api/fakeword2"}
+	for _, bad := range mustNotFind {
+		if found[srv.URL+bad] {
+			t.Errorf("wrongly flagged soft-404 noise as a finding: %s (calibration failed to adapt to this directory's template)", bad)
+		}
+	}
+}
+
+func resultURLs(results []Result) []string {
+	out := make([]string, len(results))
+	for i, r := range results {
+		out[i] = r.URL
+	}
+	return out
+}
+
 // TestEmptyWordlistDoesNotPanic is a basic robustness check: calling Run
 // with no words configured should calibrate (harmlessly) and return no
 // results, not panic or hang.

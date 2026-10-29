@@ -280,7 +280,24 @@ func (e *Engine) once(ctx context.Context, r Request) Response {
 	// MaxBodyBytes long" apart from "body was truncated" — io.LimitReader
 	// alone can't distinguish those, and silently truncating a large
 	// OpenAPI/GraphQL spec produces invalid JSON with no indication of why.
-	raw, _ := io.ReadAll(io.LimitReader(hr.Body, e.cfg.MaxBodyBytes+1))
+	raw, readErr := io.ReadAll(io.LimitReader(hr.Body, e.cfg.MaxBodyBytes+1))
+	// readErr is nil for the intentional case (hitting our own
+	// MaxBodyBytes cap — io.LimitReader just signals a clean EOF there,
+	// handled below via `truncated`). A NON-nil readErr means the read
+	// genuinely failed partway through: the connection stalled past the
+	// client timeout, was reset, chunked encoding was cut off mid-stream,
+	// etc. An earlier version discarded this error entirely, so a
+	// response that failed to fully arrive looked identical to a
+	// complete, successful one — confirmed directly: a target that sends
+	// a partial body and then stalls past the timeout came back as a
+	// normal 200 with no error, carrying only the bytes that happened to
+	// arrive before the stall. Treating that as a real request error
+	// (like any other failed fetch) is what makes Classify correctly
+	// treat it as uninteresting instead of analyzing truncated-by-failure
+	// content as if it were a genuine, complete response.
+	if readErr != nil {
+		return Response{Req: r, Err: readErr, Duration: time.Since(start)}
+	}
 	truncated := int64(len(raw)) > e.cfg.MaxBodyBytes
 	body := raw
 	if truncated {

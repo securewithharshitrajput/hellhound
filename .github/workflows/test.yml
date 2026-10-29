@@ -1,0 +1,51 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: gofmt check
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: Test (race detector)
+        run: go test ./... -race -v
+
+      - name: Fuzz smoke test (short, catches regressions without a full fuzz run)
+        run: |
+          go test ./internal/analyze/ -run=^$ -fuzz=FuzzSimHash -fuzztime=10s
+          go test ./internal/analyze/ -run=^$ -fuzz=FuzzNormalizeWithRedaction -fuzztime=10s
+          go test ./internal/analyze/ -run=^$ -fuzz=FuzzClassify -fuzztime=10s
+          go test ./internal/discover/ -run=^$ -fuzz=FuzzParseOpenAPI -fuzztime=10s
+          go test ./internal/discover/ -run=^$ -fuzz=FuzzParseGraphQLIntrospection -fuzztime=10s
+          go test ./internal/wordlist/ -run=^$ -fuzz=FuzzFromJS -fuzztime=10s
+          go test ./internal/wordlist/ -run=^$ -fuzz=FuzzFromRobots -fuzztime=10s
+
+      - name: Build the actual binary
+        run: go build -o /tmp/hellhound ./cmd/hellhound
+
+      - name: Smoke test the binary runs and shows usage
+        run: /tmp/hellhound -no-banner || test $? -eq 2  # exit 2 is the expected "no -u given" usage error
