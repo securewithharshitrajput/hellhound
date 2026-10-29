@@ -62,3 +62,28 @@ func FuzzParseGraphQLIntrospection(f *testing.F) {
 		_, _ = ParseGraphQLIntrospection(body)
 	})
 }
+
+// FuzzExtractLinks feeds arbitrary bytes to the crawler's HTML link
+// extractor — it runs on page bodies the TARGET controls, so malformed or
+// adversarial markup must never panic or hang.
+func FuzzExtractLinks(f *testing.F) {
+	seeds := []string{
+		`<a href="/x">y</a>`,
+		`<a href=>`,
+		`href="` + string(make([]byte, 200)) + `"`,
+		"<a href='\x00\xff'>",
+		`<a href="data:text/html,xxx">`,
+		``,
+	}
+	for _, s := range seeds {
+		f.Add([]byte(s))
+	}
+	f.Fuzz(func(t *testing.T, body []byte) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("extractLinks panicked on %q: %v", body, r)
+			}
+		}()
+		_ = extractLinks(body)
+	})
+}

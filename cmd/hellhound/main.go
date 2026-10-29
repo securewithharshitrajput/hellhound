@@ -57,6 +57,9 @@ func main() {
 		noMine       = flag.Bool("no-mine", false, "skip mining robots.txt/homepage/JS for target-derived wordlist words")
 		maxBodyKB    = flag.Int("maxbody", 512, "max response body size to read, in KB (raise this if a large OpenAPI/GraphQL spec is being truncated)")
 		vhostFile    = flag.String("vhosts", "", "candidate-hostnames file for virtual-host discovery against -u (one hostname per line); runs in addition to content discovery")
+		crawl        = flag.Bool("crawl", false, "crawl real <a href> links from the target to find linked pages no wordlist could guess (same-origin, multi-hop)")
+		crawlDepth   = flag.Int("crawl-depth", 3, "max link-following depth when -crawl is set")
+		crawlMax     = flag.Int("crawl-max", 500, "max total pages to fetch when -crawl is set")
 		noBanner     = flag.Bool("no-banner", false, "suppress the startup banner")
 	)
 	flag.Var(headers, "H", `custom header, repeatable, format "Name: value" (e.g. -H "Authorization: Bearer xyz")`)
@@ -147,6 +150,10 @@ func main() {
 
 	if ctx.Err() == nil && *vhostFile != "" {
 		runVHostScan(ctx, eng, baseURL, *vhostFile, *calibN)
+	}
+
+	if ctx.Err() == nil && *crawl {
+		runCrawl(ctx, eng, baseURL, *crawlDepth, *crawlMax)
 	}
 
 	if *jsonOut != "" {
@@ -282,6 +289,24 @@ func runVHostScan(ctx context.Context, eng *engine.Engine, baseURL, vhostFile st
 	for _, r := range results {
 		fmt.Printf("    %-40s [%d] len=%d  %s\n", r.Host, r.Status, r.Length, r.Reason)
 	}
+}
+
+// runCrawl follows real links from the target to surface pages no wordlist
+// could guess — the one job a pure fuzzer structurally can't do, and the
+// gap this closes versus katana.
+func runCrawl(ctx context.Context, eng *engine.Engine, baseURL string, depth, maxPages int) {
+	start := time.Now()
+	fmt.Fprintf(os.Stderr, "\nhellhound: crawling %s for linked pages (max depth %d, max %d pages)...\n", baseURL, depth, maxPages)
+	results := discover.Crawl(ctx, eng, baseURL, depth, maxPages)
+	if len(results) == 0 {
+		fmt.Println("\n[crawl] no additional linked pages found")
+	} else {
+		fmt.Printf("\n[crawl] %d linked page(s) found by following links:\n", len(results))
+		for _, r := range results {
+			fmt.Printf("    [%d] (depth %d) %s\n", r.Status, r.Depth, r.URL)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "hellhound: crawl done in %s\n", time.Since(start).Round(time.Millisecond))
 }
 
 func loadWordlistFile(path string) []string {

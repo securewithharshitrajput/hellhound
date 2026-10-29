@@ -31,6 +31,7 @@ Pure brute force (ffuf) and pure crawling (katana) both treat every endpoint the
 | Wordlist | Static, supplied by you | **Mined from the target itself** — robots.txt, linked JS, tech fingerprinting |
 | API surface | Guessed path by path | **Reads the target's own OpenAPI/Swagger spec or GraphQL schema directly** when exposed — one hit yields the entire route map |
 | Virtual hosts | Not covered | **Calibrated Host-header fuzzing** finds internal vhosts DNS never advertised |
+| Link crawling | katana crawls, ffuf can't | **Both**: calibrated fuzzing *and* same-origin multi-hop crawling (`-crawl`) — reaches pages that are only linked (a random slug, an internal report) which no wordlist can guess |
 | Resilience | — | Survives WAF deny pages, redirect-everything proxies, dead targets, and malformed input *by design*, not by luck (see [Testing](#testing)) |
 
 ---
@@ -94,6 +95,9 @@ hellhound -u https://target.tld -w wordlist.txt -ext .bak,.old,.zip -c 60
 # Hunt internal virtual hosts on a box you already have an IP for
 hellhound -u http://10.0.0.5 -vhosts vhosts.txt
 
+# Fuzz AND crawl — find guessable paths and link-only pages in one run
+hellhound -u https://target.tld -crawl
+
 # Authenticated scan behind an auth header, self-signed dev cert
 hellhound -u https://staging.internal -H "Authorization: Bearer <token>" -k
 
@@ -147,6 +151,9 @@ The banner at the top is randomized per run (Metasploit-style rotating tips) and
 | `-timeout` | `10s` | Per-request timeout |
 | `-maxbody` | `512` (KB) | Max response body to read — raise it if a large OpenAPI/GraphQL spec looks truncated |
 | `-vhosts` | — | Candidate-hostnames file for virtual-host discovery against `-u` |
+| `-crawl` | `false` | Crawl real `<a href>`/`src`/`action` links (same-origin, multi-hop) to find linked pages no wordlist could guess |
+| `-crawl-depth` | `3` | Max link-following depth when `-crawl` is set |
+| `-crawl-max` | `500` | Max total pages to fetch when `-crawl` is set |
 | `-no-mine` | `false` | Skip mining robots.txt/homepage/JS for target-derived words |
 | `-no-banner` | `false` | Suppress the startup banner |
 | `-json` | — | Write the full structured report to this path |
