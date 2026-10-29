@@ -4,10 +4,56 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/securewithharshitrajput/hellhound/internal/engine"
 )
+
+// TestBuildWordlistFetchesRobotsAndHomepageConcurrently locks in a real
+// bug fix found against a live, slow/rate-limited target: robots.txt and
+// the homepage used to be fetched one after another, so a slow target
+// cost 2x its response time just for this step, before calibration or
+// fuzzing even started. Using a server where each endpoint deliberately
+// takes 300ms, concurrent fetches should take ~300ms total; sequential
+// fetches would take ~600ms+.
+func TestBuildWordlistFetchesRobotsAndHomepageConcurrently(t *testing.T) {
+	const delay = 300 * time.Millisecond
+	var concurrentPeak atomic.Int32
+	var inFlight atomic.Int32
+
+	mux := http.NewServeMux()
+	slow := func(body string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			n := inFlight.Add(1)
+			for {
+				cur := concurrentPeak.Load()
+				if n <= cur || concurrentPeak.CompareAndSwap(cur, n) {
+					break
+				}
+			}
+			time.Sleep(delay)
+			inFlight.Add(-1)
+			w.Write([]byte(body))
+		}
+	}
+	mux.HandleFunc("/robots.txt", slow("User-agent: *\n"))
+	mux.HandleFunc("/", slow("<html><body>home</body></html>"))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	start := time.Now()
+	BuildWordlist(context.Background(), testEngine(), srv.URL, nil)
+	elapsed := time.Since(start)
+
+	if concurrentPeak.Load() < 2 {
+		t.Errorf("robots.txt and homepage were never in flight at the same time (peak concurrency = %d) — fetched sequentially, not concurrently", concurrentPeak.Load())
+	}
+	if elapsed > delay+200*time.Millisecond {
+		t.Errorf("took %s, want close to %s (concurrent) not ~%s (sequential)", elapsed, delay, 2*delay)
+	}
+}
 
 // TestBuildWordlistMinesTargetSpecificWords proves the "learn from the
 // target" step actually works end-to-end against a real HTTP server: a

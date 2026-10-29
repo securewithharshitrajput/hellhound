@@ -29,10 +29,24 @@ const maxJSFiles = 8
 // robots.txt and the homepage can hand back real route fragments and an
 // explicit "please don't look here" list from the target itself, before a
 // single fuzz request is sent.
+//
+// robots.txt and the homepage are fetched CONCURRENTLY (via DoAll), not
+// sequentially — found against a real slow/rate-limited target (Vercel's
+// bot-mitigation challenge page stalling requests): a sequential version
+// took 2x the configured timeout just to fail this step, before
+// calibration or fuzzing even started. Same fix as the API-probing phase
+// got earlier; this phase had the identical bug and was never caught
+// until a real target surfaced it.
 func BuildWordlist(ctx context.Context, eng *engine.Engine, baseURL string, seed []string) []string {
 	var mined []string
 
-	if robots := eng.Do(ctx, engine.Request{Method: "GET", URL: baseURL + "/robots.txt"}); robots.Err == nil && robots.Status == 200 {
+	first := eng.DoAll(ctx, []engine.Request{
+		{Method: "GET", URL: baseURL + "/robots.txt"},
+		{Method: "GET", URL: baseURL + "/"},
+	})
+	robots, home := first[0], first[1]
+
+	if robots.Err == nil && robots.Status == 200 {
 		paths := wordlist.FromRobots(robots.Body)
 		mined = append(mined, wordlist.PathToWords(paths)...)
 		for _, p := range paths { // also keep full paths verbatim, not just decomposed fragments
@@ -42,7 +56,6 @@ func BuildWordlist(ctx context.Context, eng *engine.Engine, baseURL string, seed
 		}
 	}
 
-	home := eng.Do(ctx, engine.Request{Method: "GET", URL: baseURL + "/"})
 	if home.Err != nil {
 		return wordlist.Merge(seed, mined)
 	}
@@ -57,12 +70,17 @@ func BuildWordlist(ctx context.Context, eng *engine.Engine, baseURL string, seed
 	if len(srcs) > maxJSFiles {
 		srcs = srcs[:maxJSFiles]
 	}
+	// Same reasoning as above: up to maxJSFiles requests, previously fired
+	// one at a time — against a slow target that's maxJSFiles * timeout
+	// instead of roughly one timeout, total.
+	jsReqs := make([]engine.Request, 0, len(srcs))
 	for _, src := range srcs {
-		jsURL := resolveScriptURL(baseURL, src)
-		if jsURL == "" {
-			continue
+		if jsURL := resolveScriptURL(baseURL, src); jsURL != "" {
+			jsReqs = append(jsReqs, engine.Request{Method: "GET", URL: jsURL})
 		}
-		if js := eng.Do(ctx, engine.Request{Method: "GET", URL: jsURL}); js.Err == nil && js.Status == 200 {
+	}
+	for _, js := range eng.DoAll(ctx, jsReqs) {
+		if js.Err == nil && js.Status == 200 {
 			mined = append(mined, wordlist.PathToWords(wordlist.FromJS(js.Body))...)
 		}
 	}
