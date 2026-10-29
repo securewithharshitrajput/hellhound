@@ -9,8 +9,8 @@ import (
 	"io"
 	"sort"
 
-	"hellhound/internal/analyze"
-	"hellhound/internal/discover"
+	"github.com/securewithharshitrajput/hellhound/internal/analyze"
+	"github.com/securewithharshitrajput/hellhound/internal/discover"
 )
 
 // JSONFinding is the wire format for one discovery result.

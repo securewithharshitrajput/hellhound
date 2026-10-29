@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"hellhound/internal/engine"
+	"github.com/securewithharshitrajput/hellhound/internal/engine"
 )
 
 func testEngine() *engine.Engine {

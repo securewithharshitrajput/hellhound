@@ -3,7 +3,7 @@ package analyze
 import (
 	"testing"
 
-	"hellhound/internal/engine"
+	"github.com/securewithharshitrajput/hellhound/internal/engine"
 )
 
 func fakeResp(status int, body []byte) engine.Response {

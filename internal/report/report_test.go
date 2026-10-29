@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"hellhound/internal/analyze"
-	"hellhound/internal/discover"
+	"github.com/securewithharshitrajput/hellhound/internal/analyze"
+	"github.com/securewithharshitrajput/hellhound/internal/discover"
 )
 
 func mkResult(url string, status int, body string) discover.Result {

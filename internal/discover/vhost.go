@@ -10,8 +10,8 @@ package discover
 import (
 	"context"
 
-	"hellhound/internal/analyze"
-	"hellhound/internal/engine"
+	"github.com/securewithharshitrajput/hellhound/internal/analyze"
+	"github.com/securewithharshitrajput/hellhound/internal/engine"
 )
 
 // VHostResult is one candidate hostname whose response differed from the

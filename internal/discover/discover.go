@@ -10,8 +10,8 @@ import (
 	"fmt"
 	"strings"
 
-	"hellhound/internal/analyze"
-	"hellhound/internal/engine"
+	"github.com/securewithharshitrajput/hellhound/internal/analyze"
+	"github.com/securewithharshitrajput/hellhound/internal/engine"
 )
 
 // Options configures a discovery run.

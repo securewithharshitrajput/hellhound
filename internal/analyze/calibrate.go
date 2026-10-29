@@ -12,7 +12,7 @@ import (
 	"math/rand"
 	"strings"
 
-	"hellhound/internal/engine"
+	"github.com/securewithharshitrajput/hellhound/internal/engine"
 )
 
 // Baseline is the learned "not found" fingerprint for one base path.

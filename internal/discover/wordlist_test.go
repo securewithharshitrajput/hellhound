@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"hellhound/internal/engine"
+	"github.com/securewithharshitrajput/hellhound/internal/engine"
 )
 
 // TestBuildWordlistMinesTargetSpecificWords proves the "learn from the

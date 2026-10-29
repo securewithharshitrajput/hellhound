@@ -18,11 +18,11 @@ import (
 	"syscall"
 	"time"
 
-	"hellhound/internal/banner"
-	"hellhound/internal/discover"
-	"hellhound/internal/engine"
-	"hellhound/internal/report"
-	"hellhound/internal/wordlist"
+	"github.com/securewithharshitrajput/hellhound/internal/banner"
+	"github.com/securewithharshitrajput/hellhound/internal/discover"
+	"github.com/securewithharshitrajput/hellhound/internal/engine"
+	"github.com/securewithharshitrajput/hellhound/internal/report"
+	"github.com/securewithharshitrajput/hellhound/internal/wordlist"
 )
 
 // headerFlag lets -H be repeated on the command line (flag.String only

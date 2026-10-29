@@ -12,8 +12,8 @@ import (
 	"regexp"
 	"strings"
 
-	"hellhound/internal/engine"
-	"hellhound/internal/wordlist"
+	"github.com/securewithharshitrajput/hellhound/internal/engine"
+	"github.com/securewithharshitrajput/hellhound/internal/wordlist"
 )
 
 var scriptSrcRe = regexp.MustCompile(`<script[^>]+src=["']([^"']+)["']`)

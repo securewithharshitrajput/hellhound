@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"hellhound/internal/engine"
+	"github.com/securewithharshitrajput/hellhound/internal/engine"
 )
 
 // softFake simulates a server whose "not found" page embeds a per-request
