@@ -14,7 +14,22 @@ import (
 // volatileRe strips tokens that commonly vary per-request (timestamps, UUIDs,
 // request ids, CSRF tokens, hex/decimal ids) so they don't fragment what is
 // otherwise the same template into many different fingerprints.
-var volatileRe = regexp.MustCompile(`(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\b\d{4}-\d{2}-\d{2}(?:[t ]\d{2}:\d{2}:\d{2})?\b|\b[0-9a-f]{6,}\b|\b\d{6,}\b`)
+//
+// The timestamp branch also consumes a trailing RFC3339 timezone offset
+// (+05:30, -08:00, or Z) — found via a real-world false positive: a server
+// whose "not found" page embeds a full RFC3339 timestamp (...T13:20:02+05:30)
+// left the "+05:30" suffix unmatched (the date/time portion alone doesn't
+// reach it), so it survived as consistent, un-redacted template text — right
+// up until a fuzzed WORD happened to literally be "05", whose own
+// word-boundary-anchored redaction (see Normalize) then struck the "05"
+// inside "+05:30" too, producing "+~:30" instead of "+05:30" — a change
+// invisible by inspection but enough to desync that one candidate's hash
+// from the baseline. Consuming the whole timezone suffix here removes the
+// target entirely, rather than trying to anticipate every word that might
+// collide with it.
+const volatilePattern = `[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\b\d{4}-\d{2}-\d{2}(?:[t ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:\d{2})?)?\b|\b[0-9a-f]{6,}\b|\b\d{6,}\b`
+
+var volatileRe = regexp.MustCompile(`(?i)` + volatilePattern)
 
 // Normalize removes volatile tokens prior to hashing/word-shingling. extra
 // lets the caller redact known attacker-controlled input (the exact path
@@ -31,44 +46,94 @@ var volatileRe = regexp.MustCompile(`(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-
 // hash from the baseline and makes a page that's byte-for-byte identical to
 // every other soft-404 wrongly look unique.
 //
-// extra is redacted BEFORE volatileRe, not after. Found by testing at
-// scale (50,000 random candidate words): whenever a fuzzed word itself
-// happens to look like a generic volatile token — 6+ hex characters, a
-// 6+ digit number, a UUID shape — volatileRe used to strike out the bare
-// word FIRST, consuming it without its leading "/" and leaving that slash
-// stranded in the output (".../looking for: /~" instead of ".../looking
-// for: ~"). That stray character shifted the SimHash just enough to push
-// an otherwise byte-for-byte-identical soft-404 page past the similarity
-// threshold — a real, measured ~0.1% false-positive rate on a large
-// wordlist, not a theoretical concern. Redacting the known echoed input
-// first removes it (and its slash) as one unit; volatileRe then only ever
-// sees whatever's left, which is exactly the unrelated server-generated
-// noise it exists to catch.
+// extra and the fixed volatile patterns are redacted in ONE combined pass
+// (one compiled regex, one ReplaceAll), not two sequential passes. Two
+// sequential passes was tried first and broke in both possible orderings:
+//
+//   - extra-first, then volatile: whenever a fuzzed word happened to look
+//     like a generic volatile token (6+ hex chars, a 6+ digit number),
+//     redacting it against the ALREADY-volatile-stripped text was fine —
+//     but a plain short word like "05" would strike its own occurrence
+//     inside an unrelated timestamp's timezone offset ("+05:30" ->
+//     "+~:30") before the volatile pass ever got a chance to consume that
+//     timestamp as one intact unit, desyncing that one candidate's hash
+//     from the baseline. Measured directly against a real target.
+//   - volatile-first, then extra: a fuzzed word that itself looks hex-like
+//     ("004cc4") gets stripped by the generic hex pattern BEFORE the
+//     explicit path redaction runs, consuming the bare word without its
+//     leading "/" and leaving that slash stranded — a real, measured
+//     ~0.1% false-positive rate on a 50,000-word wordlist.
+//
+// Combining both pattern sets into one regex and replacing in a single
+// pass resolves both: Go's regexp finds whichever match starts EARLIEST
+// in the string, so the full date+time(+timezone) pattern — which starts
+// matching at the date's first digit, well before "05" appears later
+// inside the timezone offset — always wins that case automatically by
+// position; and the full "/004cc4" pattern (which starts one character
+// earlier, at the leading slash, than either the bare word alone or the
+// generic hex pattern can) wins the leftover-slash case the same way.
+// Neither fix requires reasoning about pattern ORDER once there's only
+// one pass — position alone decides it.
 func Normalize(body []byte, extra ...string) []byte {
-	out := body
+	patterns := make([]string, 0, len(extra)+1)
 	for _, e := range extra {
 		e = strings.TrimSpace(e)
 		if e == "" {
 			continue
 		}
-		// regexp.Compile (not MustCompile): e originates from operator
-		// input — a wordlist line, a vhost candidate hostname — that can
-		// contain invalid UTF-8 if the file wasn't clean text.
-		// regexp.QuoteMeta escapes regex metacharacters but does not
-		// repair invalid UTF-8, and Go's regexp engine rejects a pattern
-		// containing it; MustCompile turns that rejection into a panic
-		// that would crash the entire scan over a single malformed
-		// wordlist byte. Skipping redaction for that one token (worst
-		// case: slightly less precise calibration for that word) is a
-		// strictly better failure mode than losing every result found so
-		// far.
-		re, err := regexp.Compile(`(?i)` + boundedPattern(e))
-		if err != nil {
-			continue
-		}
-		out = re.ReplaceAll(out, []byte("~"))
+		patterns = append(patterns, boundedPattern(e))
 	}
-	return volatileRe.ReplaceAll(out, []byte("~"))
+	patterns = append(patterns, volatilePattern)
+
+	// regexp.Compile (not MustCompile): extra originates from operator
+	// input — a wordlist line, a vhost candidate hostname — that can
+	// contain invalid UTF-8 if the file wasn't clean text. QuoteMeta (used
+	// by boundedPattern) escapes regex metacharacters but does not repair
+	// invalid UTF-8, and Go's regexp engine rejects a pattern containing
+	// it; MustCompile would turn that rejection into a panic that crashes
+	// the entire scan over a single malformed wordlist byte. Falling back
+	// to just the fixed volatile pattern (which is always valid) is a
+	// strictly better failure mode than losing every result found so far.
+	re, err := regexp.Compile(`(?i)` + strings.Join(patterns, "|"))
+	if err != nil {
+		re = volatileRe
+	}
+	return replaceExceptBeforeTagClose(re, body)
+}
+
+// replaceExceptBeforeTagClose is ReplaceAll with one exception: a match
+// immediately followed by '>' is left untouched. Found against a real
+// wordlist: a fuzzed word that happens to BE a valid HTML tag name ("html",
+// "body") collides with the page's own structural tags — "<html>" and
+// "</html>" both contain the bare word "html" immediately followed by '>'
+// (true of any opening OR closing tag, since "<tag>" and "</tag>" both end
+// exactly that way), and redacting it there corrupts the document's own
+// outermost structure rather than an echoed path, producing a hash that
+// diverges from the baseline only for that one candidate word. A genuine
+// "cannot find /X" echo is never itself immediately followed by '>' (that
+// context is specific to being inside a tag), so this exclusion costs
+// nothing for real echo redaction while closing off an entire class of
+// collision. Go's regexp has no negative-lookahead to express this
+// directly, so matches are found first and selectively applied instead of
+// using ReplaceAll's single pass.
+func replaceExceptBeforeTagClose(re *regexp.Regexp, body []byte) []byte {
+	matches := re.FindAllIndex(body, -1)
+	if matches == nil {
+		return body
+	}
+	out := make([]byte, 0, len(body))
+	last := 0
+	for _, m := range matches {
+		start, end := m[0], m[1]
+		if end < len(body) && body[end] == '>' {
+			continue // leave this one exactly as it is in the source
+		}
+		out = append(out, body[last:start]...)
+		out = append(out, '~')
+		last = end
+	}
+	out = append(out, body[last:]...)
+	return out
 }
 
 // boundedPattern anchors a literal to word boundaries on whichever ends

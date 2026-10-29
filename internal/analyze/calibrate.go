@@ -126,7 +126,8 @@ func (c *Calibrator) Learn(baseDir string, probes []Probe) *Baseline {
 // verbatim, which would otherwise make every miss look unique.
 func (c *Calibrator) Classify(baseDir, path string, resp engine.Response) Verdict {
 	baseDir = normalizeDir(baseDir)
-	hash := SimHash(resp.Body, path, lastSegment(path))
+	echoed := echoedPath(path)
+	hash := SimHash(resp.Body, echoed, lastSegment(echoed))
 	b := c.baselines[baseDir]
 
 	if resp.Err != nil {
@@ -195,6 +196,29 @@ func lastSegment(path string) string {
 	path = strings.TrimRight(path, "/")
 	if i := strings.LastIndex(path, "/"); i >= 0 {
 		return path[i+1:]
+	}
+	return path
+}
+
+// echoedPath strips a query-string suffix from a candidate path, giving
+// back the portion a server actually sees as r.URL.Path (and so the
+// portion a "page X not found" template would actually echo back).
+//
+// Found against a real wordlist (SecLists' common.txt) containing entries
+// like "dns-query?dns=AAAA...": joinDir concatenates this directly into
+// the request URL, and Go's HTTP layer correctly treats everything after
+// "?" as a query string — so the server only ever echoes "/dns-query" in
+// its response, never the literal "?dns=AAAA..." suffix. Classify was
+// redacting the FULL candidate string including the query part, which
+// never appears in the body verbatim, so the redaction silently matched
+// nothing, left "/dns-query" un-redacted in the normalized text, and
+// desynced that candidate's hash from the baseline — a real false
+// positive on roughly 0.06% of a 4,751-word real-world list (3 entries),
+// but each one also triggered the costly cascade of looking like a new
+// "directory" worth recursing into.
+func echoedPath(path string) string {
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		return path[:i]
 	}
 	return path
 }

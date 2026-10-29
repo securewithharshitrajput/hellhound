@@ -38,6 +38,7 @@ type Result struct {
 	Lines       int
 	Depth       int
 	ContentType string
+	RedirectTo  string
 	Verdict     analyze.Verdict
 }
 
@@ -186,6 +187,7 @@ func (d *Discoverer) scanDir(ctx context.Context, dir string, depth int) ([]Resu
 			Lines:       resp.Lines,
 			Depth:       depth,
 			ContentType: resp.Header.Get("Content-Type"),
+			RedirectTo:  resp.RedirectTo,
 			Verdict:     v,
 		})
 	}
@@ -221,12 +223,19 @@ func looksLikeDirectory(r Result) bool {
 		return false // looks like a file (app.js, config.bak), not a directory
 	}
 	if r.Status >= 300 && r.Status < 400 {
-		return true // a redirect (often to a trailing slash) is worth a peek regardless of content-type
+		// Only a redirect that actually looks like "this is a directory,
+		// go to the trailing-slash form" is worth recursing into — not
+		// any redirect whatsoever. Found against a real wordlist
+		// (SecLists common.txt): several entries contain "//" (e.g.
+		// "render/https://www.google.com"), which net/http's own
+		// ServeMux auto-redirects to its slash-collapsed form as a
+		// built-in path-cleaning behavior — a mechanical artifact of the
+		// request shape, not a real directory, and recursing into each
+		// one multiplied a handful of malformed-looking wordlist entries
+		// into dozens of full wordlist re-scans.
+		return strings.HasSuffix(r.RedirectTo, "/")
 	}
 	ct := strings.ToLower(r.ContentType)
-	if ct == "" {
-		return true // ambiguous (many servers omit Content-Type on directory indexes) — err toward recursing
-	}
 	for _, leafType := range []string{
 		"application/json", "application/xml", "application/octet-stream",
 		"application/zip", "application/pdf", "image/", "video/", "audio/", "font/",
@@ -235,7 +244,15 @@ func looksLikeDirectory(r Result) bool {
 			return false
 		}
 	}
-	return true
+	// An earlier version treated an ambiguous/missing Content-Type as
+	// "assume directory" (erring toward not missing a real one). Flipped
+	// to require an explicit, non-leaf Content-Type after a real
+	// comparison run: a calibration false positive on ".git/config" (a
+	// FILE, which this server happened to serve with no Content-Type set)
+	// got recursed into, multiplying one bad classification into a full
+	// extra wordlist pass. Missing a genuine directory that serves no
+	// Content-Type is a real but rarer cost than that cascade.
+	return ct != "" && !strings.Contains(ct, "text/plain")
 }
 
 func normalizeDir(p string) string {

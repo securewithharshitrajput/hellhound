@@ -202,3 +202,87 @@ func TestRandomTokenVariesAcrossCalls(t *testing.T) {
 		seen[tok] = true
 	}
 }
+
+// TestClassifyHandlesQueryStringInCandidate locks in a real bug fix found
+// against a real-world wordlist (SecLists common.txt contains entries
+// like "dns-query?dns=..."): a candidate word containing "?" gets split
+// by the HTTP layer into path + query string, so the server only ever
+// echoes the pre-"?" portion back. Classify used to redact the FULL
+// candidate (including the query part), which never appears verbatim in
+// the body, silently failing to match and leaving the real path
+// un-redacted — desyncing the hash from the baseline.
+func TestClassifyHandlesQueryStringInCandidate(t *testing.T) {
+	soft404 := func(path string) []byte {
+		return []byte(fmt.Sprintf(`<html><body><h1>Oops!</h1><p>Page %s not found.</p><p>ref=bd940dd8</p></body></html>`, path))
+	}
+	c := NewCalibrator()
+	var probes []Probe
+	for i := 0; i < 6; i++ {
+		tok := RandomToken()
+		probes = append(probes, Probe{Token: tok, Resp: fakeResp(200, soft404("/"+tok))})
+	}
+	c.Learn("/", probes)
+
+	queryCandidate := "/dns-query?dns=q80BAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB.zip"
+	// What the server actually returns: it only ever sees r.URL.Path, the
+	// part before "?", regardless of what garbage follows.
+	resp := fakeResp(200, soft404("/dns-query"))
+	v := c.Classify("/", queryCandidate, resp)
+	if v.Interesting {
+		t.Errorf("query-string-containing candidate wrongly classified as interesting: %q", v.Reason)
+	}
+}
+
+// TestTimestampWithTimezoneSurvivesCoincidentalWordCollision locks in a
+// real bug fix found against the same real-world wordlist: a plain short
+// fuzzed word ("05") coincidentally collided with the timezone offset
+// digits inside an otherwise-constant RFC3339 timestamp ("+05:30"),
+// mangling it to "+~:30" only for that one candidate and desyncing its
+// hash from the baseline — the same underlying problem as the earlier
+// "admin" vs "administrator" fix, but via a timestamp fragment instead of
+// a dictionary word, and requiring the redaction passes to be combined
+// into one regex rather than run sequentially in either order.
+func TestTimestampWithTimezoneSurvivesCoincidentalWordCollision(t *testing.T) {
+	soft404 := func(path string) []byte {
+		return []byte(fmt.Sprintf(`Page %s not found. time=2026-10-29T13:20:02+05:30`, path))
+	}
+	c := NewCalibrator()
+	var probes []Probe
+	for i := 0; i < 6; i++ {
+		tok := RandomToken()
+		probes = append(probes, Probe{Token: tok, Resp: fakeResp(200, soft404("/"+tok))})
+	}
+	c.Learn("/", probes)
+
+	v := c.Classify("/", "/05", fakeResp(200, soft404("/05")))
+	if v.Interesting {
+		t.Errorf("'/05' colliding with the timezone offset wrongly classified as interesting: %q", v.Reason)
+	}
+}
+
+// TestWordCollidingWithOwnHTMLTagIsNotFalsePositive locks in a real bug
+// fix found against the same real-world wordlist: a fuzzed word that
+// happens to BE a valid HTML tag name ("html", "body") collides with the
+// page's own opening/closing structural tags — "<html>" and "</html>"
+// both contain the bare word immediately followed by '>' — corrupting the
+// document's outermost structure for that one candidate only and
+// desyncing its hash from the baseline.
+func TestWordCollidingWithOwnHTMLTagIsNotFalsePositive(t *testing.T) {
+	soft404 := func(path string) []byte {
+		return []byte(fmt.Sprintf(`<html><body><h1>Oops!</h1><p>Page %s not found.</p></body></html>`, path))
+	}
+	c := NewCalibrator()
+	var probes []Probe
+	for i := 0; i < 6; i++ {
+		tok := RandomToken()
+		probes = append(probes, Probe{Token: tok, Resp: fakeResp(200, soft404("/"+tok))})
+	}
+	c.Learn("/", probes)
+
+	for _, word := range []string{"html", "HTML", "body", "head", "title"} {
+		v := c.Classify("/", "/"+word, fakeResp(200, soft404("/"+word)))
+		if v.Interesting {
+			t.Errorf("word %q (a valid HTML tag name) wrongly classified as interesting via its own tag collision: %q", word, v.Reason)
+		}
+	}
+}
