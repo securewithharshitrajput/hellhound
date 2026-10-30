@@ -21,7 +21,7 @@ import (
 
 // Version is the tool's displayed version. Bump this on meaningful
 // feature changes.
-const Version = "0.2.0"
+const Version = "0.4.0"
 
 // Tagline appears under the logo and in the no-TTY fallback line.
 const Tagline = "calibrated recon beyond ffuf & katana"
@@ -43,6 +43,9 @@ var tips = []string{
 	"tip: findings are reported by cluster, not raw hit count — read the cluster count first",
 	"tip: -k skips TLS verification for self-signed dev/staging certs — never use it on prod scope",
 	"tip: recursion only follows hits that actually look like directories, not JSON leaf endpoints",
+	"tip: -x http://127.0.0.1:8080 routes everything through Burp/ZAP (add -k for HTTPS)",
+	"tip: -rate N caps requests/sec to stay under a target's WAF/bot thresholds",
+	"tip: -crawl follows real links to find pages no wordlist could ever guess",
 }
 
 // glyphs maps each supported letter to a 5-row block-letter cell. Rows

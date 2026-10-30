@@ -286,3 +286,62 @@ func TestWordCollidingWithOwnHTMLTagIsNotFalsePositive(t *testing.T) {
 		}
 	}
 }
+
+// TestChromeCollisionWordsAreNotFalsePositives locks in the symmetric-
+// redaction fix — the dominant remaining false-positive class from the
+// real head-to-head comparison on SecLists common.txt. A fuzzed word that
+// collides with the soft-404 template's OWN fixed text ("Page not found",
+// "ref=") used to desync that candidate's hash from the baseline (the
+// candidate side redacted the word out of the chrome, the baseline side
+// didn't). Redacting the candidate word from the baseline body too cancels
+// the collision on both sides; a genuine hit still differs and stays flagged.
+func TestChromeCollisionWordsAreNotFalsePositives(t *testing.T) {
+	soft404 := func(path string) []byte {
+		return []byte(fmt.Sprintf(`<html><body><h1>Oops!</h1><p>Page %s not found.</p><p>ref=bd940dd8 time=2026-10-29T13:20:02+05:30</p></body></html>`, path))
+	}
+	c := NewCalibrator()
+	var probes []Probe
+	for i := 0; i < 6; i++ {
+		tok := RandomToken()
+		probes = append(probes, Probe{Token: tok, Resp: fakeResp(200, soft404("/"+tok))})
+	}
+	c.Learn("/", probes)
+
+	for _, w := range []string{"page", "ref", "found", "not", "Oops"} {
+		if v := c.Classify("/", "/"+w, fakeResp(200, soft404("/"+w))); v.Interesting {
+			t.Errorf("chrome-colliding word %q wrongly flagged: %q", w, v.Reason)
+		}
+	}
+	// A genuinely different page must still be reported.
+	real := []byte(`<html><body><h1>Admin Panel</h1><table><tr><td>users here</td></tr></table></body></html>`)
+	if v := c.Classify("/", "/admin", fakeResp(200, real)); !v.Interesting {
+		t.Errorf("real page wrongly suppressed by symmetric redaction: %q", v.Reason)
+	}
+}
+
+// TestSlashNormalizationRedirectSuppressed locks in suppression of a
+// mechanical "server collapsed //" redirect (from a malformed wordlist
+// entry) while keeping real redirects.
+func TestSlashNormalizationRedirectSuppressed(t *testing.T) {
+	c := NewCalibrator()
+	var probes []Probe
+	for i := 0; i < 6; i++ {
+		tok := RandomToken()
+		probes = append(probes, Probe{Token: tok, Resp: fakeResp(200, []byte("<html>not found "+tok+"</html>"))})
+	}
+	c.Learn("/", probes)
+
+	// A // -> / normalization redirect: suppressed.
+	norm := fakeResp(301, []byte(""))
+	norm.RedirectTo = "/render/https:/www.google.com"
+	if v := c.Classify("/", "/render/https://www.google.com", norm); v.Interesting {
+		t.Errorf("slash-normalization redirect should be suppressed, got: %q", v.Reason)
+	}
+
+	// A real redirect to a different path: kept.
+	real := fakeResp(307, []byte(""))
+	real.RedirectTo = "/login?from=%2Fadmin"
+	if v := c.Classify("/", "/admin", real); !v.Interesting {
+		t.Errorf("real /admin -> /login redirect should be reported, got suppressed: %q", v.Reason)
+	}
+}

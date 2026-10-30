@@ -32,6 +32,7 @@ Pure brute force (ffuf) and pure crawling (katana) both treat every endpoint the
 | API surface | Guessed path by path | **Reads the target's own OpenAPI/Swagger spec or GraphQL schema directly** when exposed — one hit yields the entire route map |
 | Virtual hosts | Not covered | **Calibrated Host-header fuzzing** finds internal vhosts DNS never advertised |
 | Link crawling | katana crawls, ffuf can't | **Both**: calibrated fuzzing *and* same-origin multi-hop crawling (`-crawl`) — reaches pages that are only linked (a random slug, an internal report) which no wordlist can guess |
+| Engagement fit | ffuf has `-x`/`-rate`; katana limited | **Proxy (`-x`) for Burp/ZAP + true requests/sec rate limit (`-rate`)** to stay under WAF/bot thresholds |
 | Resilience | — | Survives WAF deny pages, redirect-everything proxies, dead targets, and malformed input *by design*, not by luck (see [Testing](#testing)) |
 
 ---
@@ -62,10 +63,10 @@ flowchart LR
 ## Install
 
 ```bash
-go install github.com/securewithharshitrajput/hellhound/cmd/hellhound@v0.3.0
+go install github.com/securewithharshitrajput/hellhound/cmd/hellhound@v0.4.0
 ```
 
-(Pin to a tagged version like `@v0.3.0` rather than `@latest` — Go's module proxy caches version lookups, and `@latest` against an untagged commit can serve a stale result until the proxy's cache naturally refreshes. A tagged release doesn't have that problem.)
+(Pin to a tagged version like `@v0.4.0` rather than `@latest` — Go's module proxy caches version lookups, and `@latest` against an untagged commit can serve a stale result until the proxy's cache naturally refreshes. A tagged release doesn't have that problem.)
 
 This drops a `hellhound` binary into `$(go env GOBIN)` (usually `~/go/bin`) — the same place `ffuf`/`katana` live. Make sure that's on your `PATH` and you're done:
 
@@ -97,6 +98,9 @@ hellhound -u http://10.0.0.5 -vhosts vhosts.txt
 
 # Fuzz AND crawl — find guessable paths and link-only pages in one run
 hellhound -u https://target.tld -crawl
+
+# Route through Burp for inspection, throttled to stay under WAF thresholds
+hellhound -u https://target.tld -x http://127.0.0.1:8080 -k -rate 20
 
 # Authenticated scan behind an auth header, self-signed dev cert
 hellhound -u https://staging.internal -H "Authorization: Bearer <token>" -k
@@ -148,6 +152,8 @@ The banner at the top is randomized per run (Metasploit-style rotating tips) and
 | `-ext` | — | Comma-separated extensions to try, e.g. `.php,.bak,.old` |
 | `-H` | — | Custom header, repeatable: `-H "Name: value"` |
 | `-k` | `false` | Skip TLS verification (self-signed dev/staging certs **only** — never on production scope) |
+| `-x` | — | Route all requests through an HTTP proxy, e.g. `http://127.0.0.1:8080` for Burp/ZAP (HTTPS through Burp usually also needs `-k`) |
+| `-rate` | `0` | Max requests/sec across all workers (0 = unlimited) — stay under a target's rate-based WAF/bot thresholds |
 | `-timeout` | `10s` | Per-request timeout |
 | `-maxbody` | `512` (KB) | Max response body to read — raise it if a large OpenAPI/GraphQL spec looks truncated |
 | `-vhosts` | — | Candidate-hostnames file for virtual-host discovery against `-u` |

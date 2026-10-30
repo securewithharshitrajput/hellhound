@@ -57,6 +57,8 @@ func main() {
 		noMine       = flag.Bool("no-mine", false, "skip mining robots.txt/homepage/JS for target-derived wordlist words")
 		maxBodyKB    = flag.Int("maxbody", 512, "max response body size to read, in KB (raise this if a large OpenAPI/GraphQL spec is being truncated)")
 		vhostFile    = flag.String("vhosts", "", "candidate-hostnames file for virtual-host discovery against -u (one hostname per line); runs in addition to content discovery")
+		proxyURL     = flag.String("x", "", "route all requests through this HTTP proxy (e.g. http://127.0.0.1:8080 for Burp/ZAP); HTTPS through Burp usually also needs -k")
+		rate         = flag.Int("rate", 0, "max requests per second across all workers (0 = unlimited); use this to stay under a target's rate-based WAF/bot thresholds")
 		crawl        = flag.Bool("crawl", false, "crawl real <a href> links from the target to find linked pages no wordlist could guess (same-origin, multi-hop)")
 		crawlDepth   = flag.Int("crawl-depth", 3, "max link-following depth when -crawl is set")
 		crawlMax     = flag.Int("crawl-max", 500, "max total pages to fetch when -crawl is set")
@@ -80,8 +82,21 @@ func main() {
 	cfg.InsecureSkipVerify = *insecure
 	cfg.DefaultHeaders = headers
 	cfg.MaxBodyBytes = int64(*maxBodyKB) * 1024
-	eng := engine.New(cfg)
+	cfg.ProxyURL = *proxyURL
+	cfg.RatePerSec = *rate
+	eng, err := engine.NewErr(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hellhound: %v\n", err)
+		os.Exit(2)
+	}
 	defer eng.Close() // not load-bearing for a one-shot process (the OS reclaims everything on exit), but correct practice and free
+
+	if *proxyURL != "" {
+		fmt.Fprintf(os.Stderr, "hellhound: routing all requests through proxy %s\n", *proxyURL)
+	}
+	if *rate > 0 {
+		fmt.Fprintf(os.Stderr, "hellhound: rate limited to %d request(s)/sec\n", *rate)
+	}
 
 	// A plain context.Background() here would mean Ctrl+C just kills the
 	// process outright — no partial results, no cleanup, matching neither

@@ -6,12 +6,53 @@ package engine
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// limiter enforces a minimum spacing between request STARTS so no more than
+// ratePerSec requests begin per second, shared across all workers. It's a
+// small dependency-free token-spacing limiter (the project pulls in no
+// external modules): each caller reserves the next time slot under a brief
+// lock, then sleeps until it, so in-flight concurrency is unaffected — only
+// the rate at which new requests launch is capped.
+type limiter struct {
+	mu       sync.Mutex
+	interval time.Duration
+	next     time.Time
+}
+
+func newLimiter(ratePerSec int) *limiter {
+	return &limiter{interval: time.Second / time.Duration(ratePerSec)}
+}
+
+// wait blocks until this caller's reserved slot, or until ctx is done.
+func (l *limiter) wait(ctx context.Context) {
+	l.mu.Lock()
+	now := time.Now()
+	slot := l.next
+	if slot.Before(now) {
+		slot = now
+	}
+	l.next = slot.Add(l.interval)
+	l.mu.Unlock()
+
+	d := time.Until(slot)
+	if d <= 0 {
+		return
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+	case <-ctx.Done():
+	}
+}
 
 // Request is a unit of work for the engine.
 type Request struct {
@@ -76,6 +117,19 @@ type Config struct {
 	// operator-supplied headers (-H) such as an auth token or a custom
 	// User-Agent override.
 	DefaultHeaders map[string]string
+	// ProxyURL, when non-empty, routes every request through this HTTP(S)
+	// proxy — the standard way to pipe recon through Burp Suite / ZAP for
+	// inspection during an engagement (e.g. "http://127.0.0.1:8080").
+	// Invalid values are reported by New via NewErr; an empty value means
+	// no proxy. Proxying HTTPS through Burp usually also needs
+	// InsecureSkipVerify (-k), since Burp presents its own CA.
+	ProxyURL string
+	// RatePerSec caps the number of requests STARTED per second across all
+	// workers (0 = unlimited, bounded only by Concurrency). A real
+	// requests/sec ceiling, separate from concurrency: it's what keeps a
+	// scan under a target's rate-based bot-mitigation / WAF thresholds
+	// instead of tripping them, and what makes "slow and quiet" possible.
+	RatePerSec int
 }
 
 // DefaultConfig returns sane defaults for authorized scanning.
@@ -85,7 +139,7 @@ func DefaultConfig() Config {
 		Timeout:            10 * time.Second,
 		FollowRedirect:     false,
 		MaxBodyBytes:       512 * 1024,
-		UserAgent:          "hellhound/0.2 (+authorized-testing)",
+		UserAgent:          "hellhound/0.4 (+authorized-testing)",
 		RetryOn429:         true,
 		InsecureSkipVerify: false,
 	}
@@ -99,19 +153,47 @@ type Engine struct {
 	// pause gates all workers during backoff. When closed, work proceeds.
 	pauseMu sync.RWMutex
 	paused  chan struct{}
+	// rate gates request STARTS to cfg.RatePerSec across all workers; nil
+	// when unlimited.
+	rate *limiter
 
 	Sent     atomic.Int64
 	Backoffs atomic.Int64
 }
 
 // New builds an Engine with a tuned transport (connection reuse, HTTP/2).
+// It ignores an invalid ProxyURL (falling back to no proxy); use NewErr if
+// you want a malformed proxy value to be reported rather than silently
+// dropped.
 func New(cfg Config) *Engine {
+	e, _ := NewErr(cfg)
+	return e
+}
+
+// NewErr is New but returns an error for a malformed ProxyURL. The Engine
+// is still returned (usable, just without the bad proxy) so a caller can
+// choose to warn-and-continue; the CLI treats a bad -x as fatal.
+func NewErr(cfg Config) (*Engine, error) {
 	tr := &http.Transport{
 		MaxIdleConns:        cfg.Concurrency * 2,
 		MaxIdleConnsPerHost: cfg.Concurrency * 2,
 		IdleConnTimeout:     30 * time.Second,
 		ForceAttemptHTTP2:   true,
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: cfg.InsecureSkipVerify},
+	}
+	var proxyErr error
+	if cfg.ProxyURL != "" {
+		pu, err := url.Parse(cfg.ProxyURL)
+		if err != nil || pu.Host == "" {
+			proxyErr = fmt.Errorf("invalid proxy URL %q (expected e.g. http://127.0.0.1:8080)", cfg.ProxyURL)
+		} else {
+			// HTTP/2 to the ORIGIN plus an HTTP/1.1 CONNECT proxy can
+			// interact badly in net/http; disabling forced-HTTP2 when a
+			// proxy is set keeps the common Burp/ZAP path reliable (they
+			// speak HTTP/1.1 anyway).
+			tr.ForceAttemptHTTP2 = false
+			tr.Proxy = http.ProxyURL(pu)
+		}
 	}
 	e := &Engine{
 		cfg:       cfg,
@@ -127,10 +209,13 @@ func New(cfg Config) *Engine {
 			},
 		},
 	}
+	if cfg.RatePerSec > 0 {
+		e.rate = newLimiter(cfg.RatePerSec)
+	}
 	ready := make(chan struct{})
 	close(ready)
 	e.paused = ready
-	return e
+	return e, proxyErr
 }
 
 // Close releases pooled idle connections. The CLI itself never needs to
@@ -268,6 +353,16 @@ func (e *Engine) once(ctx context.Context, r Request) Response {
 	}
 	for k, v := range r.Header { // per-request overrides defaults
 		httpReq.Header.Set(k, v)
+	}
+	// Rate gate goes here — immediately before the actual network call, and
+	// inside once() rather than do() — so a post-backoff retry also counts
+	// against the ceiling, and a request held by the limiter isn't counted
+	// as Sent until it truly fires.
+	if e.rate != nil {
+		e.rate.wait(ctx)
+		if ctx.Err() != nil {
+			return Response{Req: r, Err: ctx.Err()}
+		}
 	}
 	start := time.Now()
 	hr, err := e.client.Do(httpReq)

@@ -401,6 +401,102 @@ func TestSlowTrickleBodyStillRespectsTimeout(t *testing.T) {
 	t.Logf("fetch itself took %s (the test's own ~5s total wall time below is httptest.Server.Close() waiting for the slow handler goroutine to finish, not this fetch)", elapsed)
 }
 
+// TestProxyRoutesRequestsThroughConfiguredProxy proves -x actually takes
+// effect: with ProxyURL set to a local recording proxy, the request must
+// pass THROUGH it (the proxy sees the full absolute-URL request) rather
+// than going direct to the origin. This is the Burp/ZAP integration path.
+func TestProxyRoutesRequestsThroughConfiguredProxy(t *testing.T) {
+	var proxied atomic.Bool
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A forward proxy receives the request with the full absolute URL
+		// in the request line (r.RequestURI starts with "http://...").
+		if strings.HasPrefix(r.RequestURI, "http://") {
+			proxied.Store(true)
+		}
+		w.WriteHeader(200)
+		w.Write([]byte("via proxy"))
+	}))
+	defer proxy.Close()
+
+	cfg := testConfig()
+	cfg.ProxyURL = proxy.URL
+	e, err := NewErr(cfg)
+	if err != nil {
+		t.Fatalf("NewErr with valid proxy: %v", err)
+	}
+	resp := e.Do(context.Background(), Request{Method: "GET", URL: "http://example.invalid/x"})
+	if resp.Err != nil {
+		t.Fatalf("request through proxy errored: %v", resp.Err)
+	}
+	if !proxied.Load() {
+		t.Error("request did not go through the configured proxy")
+	}
+}
+
+func TestInvalidProxyURLIsReported(t *testing.T) {
+	cfg := testConfig()
+	cfg.ProxyURL = "://not a url"
+	_, err := NewErr(cfg)
+	if err == nil {
+		t.Error("expected NewErr to report a malformed proxy URL")
+	}
+}
+
+// TestRateLimitCapsRequestsPerSecond verifies the rate ceiling is real: at
+// 10 req/s, 10 requests should take roughly 1 second's worth of spacing
+// (~0.9s for 9 intervals after the first), NOT fire all at once as raw
+// concurrency would.
+func TestRateLimitCapsRequestsPerSecond(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	cfg := testConfig()
+	cfg.Concurrency = 10 // plenty of workers; the LIMITER should be the bottleneck
+	cfg.RatePerSec = 10
+	e := New(cfg)
+
+	reqs := make([]Request, 10)
+	for i := range reqs {
+		reqs[i] = Request{Method: "GET", URL: srv.URL}
+	}
+	start := time.Now()
+	e.DoAll(context.Background(), reqs)
+	elapsed := time.Since(start)
+
+	// 10 requests at 10/s = 9 intervals of 100ms after the first ≈ 0.9s.
+	// Without the limiter, 10 concurrent workers finish in milliseconds.
+	if elapsed < 800*time.Millisecond {
+		t.Errorf("10 requests at 10/s took only %s — rate limit not enforced", elapsed)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("10 requests at 10/s took %s — far slower than expected", elapsed)
+	}
+}
+
+func TestNoRateLimitIsFast(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	cfg := testConfig()
+	cfg.Concurrency = 10
+	cfg.RatePerSec = 0 // unlimited
+	e := New(cfg)
+
+	reqs := make([]Request, 50)
+	for i := range reqs {
+		reqs[i] = Request{Method: "GET", URL: srv.URL}
+	}
+	start := time.Now()
+	e.DoAll(context.Background(), reqs)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("50 unlimited requests took %s — unexpectedly slow", elapsed)
+	}
+}
+
 func TestTruncationDetection(t *testing.T) {
 	bigBody := strings.Repeat("x", 1000)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

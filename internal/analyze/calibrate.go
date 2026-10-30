@@ -22,11 +22,28 @@ type Baseline struct {
 }
 
 // Signature is one observed (status, size-bucket, simhash) combination.
+//
+// rawBody/probeToken/probeSeg retain one representative calibration probe
+// (body capped at maxTemplateBody) so Classify can re-derive this
+// baseline's hash with the CANDIDATE's word also redacted — the symmetric
+// check that defeats chrome-collision false positives (see Classify). Hash
+// stays as the cheap first-pass filter (candidate-word-independent), so the
+// expensive symmetric re-hash only runs for the small fraction of
+// candidates that the cheap filter flags as potentially interesting.
 type Signature struct {
-	Status int
-	Size   int
-	Hash   uint64
+	Status     int
+	Size       int
+	Hash       uint64
+	rawBody    []byte
+	probeToken string
+	probeSeg   string
 }
+
+// maxTemplateBody caps the representative probe body stored per signature.
+// Soft-404 templates are small; 64 KiB is far more than enough to
+// fingerprint one, and it bounds memory even with deep recursion × several
+// signatures per directory.
+const maxTemplateBody = 64 * 1024
 
 // Verdict is the analyzer's classification of a single response.
 type Verdict struct {
@@ -97,9 +114,12 @@ func (c *Calibrator) Learn(baseDir string, probes []Probe) *Baseline {
 		// two sides normalize identically and aren't thrown off by, e.g., a
 		// leftover "/" where the token used to be.
 		sig := Signature{
-			Status: p.Resp.Status,
-			Size:   sizeBucket(p.Resp.Length),
-			Hash:   SimHash(p.Resp.Body, probePath, p.Token),
+			Status:     p.Resp.Status,
+			Size:       sizeBucket(p.Resp.Length),
+			Hash:       SimHash(p.Resp.Body, probePath, p.Token),
+			rawBody:    capBytes(p.Resp.Body, maxTemplateBody),
+			probeToken: probePath,
+			probeSeg:   p.Token,
 		}
 		key := fmt.Sprintf("%d:%d", sig.Status, sig.Size)
 		seen[key] = sig // last one wins per bucket; shape compared via Hamming at classify time
@@ -145,20 +165,130 @@ func (c *Calibrator) Classify(baseDir, path string, resp engine.Response) Verdic
 	// echoed path is part of the body), so shape (hash) is the authoritative
 	// signal; size bucket is only used to deduplicate signatures during
 	// Calibrate itself.
+	// Cheap first pass: candidate hash (its own path redacted) vs the
+	// baseline's stored hash (the probe's path redacted). Matches the vast
+	// majority of real soft-404s instantly.
 	for _, sig := range b.Signatures {
 		if sig.Status == resp.Status && Hamming(sig.Hash, hash) <= simThreshold {
 			return Verdict{Interesting: false, Reason: fmt.Sprintf("matches soft-404 baseline (status %d, shape dist %d)", sig.Status, Hamming(sig.Hash, hash)), ClusterKey: hash}
 		}
 	}
 
+	// Symmetric second pass: only reached for candidates the cheap pass
+	// flagged. The cheap pass can produce a false positive when the
+	// candidate WORD coincidentally collides with the template's own fixed
+	// chrome text — e.g. fuzzing "page" against a "Page not found"
+	// template, or "ref" against "ref=...": the candidate side redacts
+	// that word (turning "Page not found" into "~ not found") while the
+	// baseline, calibrated with random tokens that never collide, kept it
+	// — so an otherwise-identical soft-404 looks different. Here we redact
+	// the CANDIDATE's word from the baseline body TOO, so the collision
+	// cancels out on both sides; a genuine hit (real content, not the
+	// template at all) still differs and stays flagged. This is the fix
+	// for the dominant remaining false-positive class found in the
+	// head-to-head comparison against ffuf/katana on a real wordlist.
+	echoedSeg := lastSegment(echoed)
+	candCapped := SimHash(capBytes(resp.Body, maxTemplateBody), echoed, echoedSeg)
+	for _, sig := range b.Signatures {
+		if sig.Status != resp.Status || len(sig.rawBody) == 0 {
+			continue
+		}
+		baseAdj := SimHash(sig.rawBody, sig.probeToken, sig.probeSeg, echoed, echoedSeg)
+		if Hamming(baseAdj, candCapped) <= simThreshold {
+			return Verdict{Interesting: false, Reason: fmt.Sprintf("matches soft-404 baseline after symmetric redaction (status %d, shape dist %d) — candidate word collided with template chrome", sig.Status, Hamming(baseAdj, candCapped)), ClusterKey: hash}
+		}
+	}
+
 	// Redirects to a login/error page are often soft-404s in disguise —
 	// flag as lower-confidence rather than dropping, since this is common
-	// on auth-gated apps and worth a human glance.
+	// on auth-gated apps and worth a human glance. BUT suppress a pure
+	// path-normalization redirect: a 3xx whose target is just the
+	// requested path with consecutive slashes collapsed is the web
+	// server's own path cleaning (net/http's ServeMux, nginx merge_slashes,
+	// etc.), triggered by a malformed wordlist entry containing "//" (e.g.
+	// SecLists' "render/https://www.google.com"), not a real resource. A
+	// meaningful redirect — "/admin" -> "/login", or "/foo" -> "/foo/"
+	// revealing a directory — changes the path in a way slash-collapsing
+	// alone doesn't, so those are still reported.
 	if resp.Status >= 300 && resp.Status < 400 {
+		if isSlashNormalizationRedirect(echoed, resp.RedirectTo) {
+			return Verdict{Interesting: false, Reason: "path-normalization redirect (server collapsed // in the requested path), not a real resource", ClusterKey: hash}
+		}
 		return Verdict{Interesting: true, Reason: fmt.Sprintf("redirect (%d) -> %s, not in baseline", resp.Status, resp.RedirectTo), ClusterKey: hash}
 	}
 
 	return Verdict{Interesting: true, Reason: fmt.Sprintf("status %d does not match any calibrated baseline shape", resp.Status), ClusterKey: hash}
+}
+
+// isSlashNormalizationRedirect reports whether a redirect from reqPath to
+// location is nothing but the server collapsing duplicate slashes in the
+// requested path — a mechanical artifact, not a navigation to a different
+// resource. True only when the two paths differ AND become identical once
+// consecutive slashes are collapsed (so a trailing-slash-added directory
+// redirect, "/foo" -> "/foo/", is NOT matched and stays reportable).
+func isSlashNormalizationRedirect(reqPath, location string) bool {
+	loc := pathOnly(location)
+	if loc == "" || loc == reqPath {
+		return false
+	}
+	return collapseSlashes(reqPath) == collapseSlashes(loc) && reqPath != loc
+}
+
+// pathOnly extracts the path portion of a possibly-absolute-or-relative URL
+// reference (dropping scheme+host, query, and fragment), without importing
+// net/url for this one small job.
+func pathOnly(ref string) string {
+	if i := strings.Index(ref, "://"); i >= 0 {
+		rest := ref[i+3:]
+		if j := strings.IndexByte(rest, '/'); j >= 0 {
+			ref = rest[j:]
+		} else {
+			return "/"
+		}
+	}
+	if i := strings.IndexAny(ref, "?#"); i >= 0 {
+		ref = ref[:i]
+	}
+	return ref
+}
+
+// collapseSlashes replaces runs of consecutive '/' with a single '/'. A
+// trailing slash is preserved (it's significant: it distinguishes a
+// directory redirect from a slash-cleaning one).
+func collapseSlashes(p string) string {
+	if !strings.Contains(p, "//") {
+		return p
+	}
+	var b strings.Builder
+	b.Grow(len(p))
+	prevSlash := false
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		if c == '/' {
+			if prevSlash {
+				continue
+			}
+			prevSlash = true
+		} else {
+			prevSlash = false
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+// capBytes returns b unchanged when it's already within n (soft-404 bodies,
+// the common case, are tiny), otherwise a COPY of its first n bytes — a
+// copy rather than a sub-slice so truncating a large body doesn't leave the
+// stored baseline pinning the whole original response via a shared backing
+// array.
+func capBytes(b []byte, n int) []byte {
+	if len(b) <= n {
+		return b
+	}
+	out := make([]byte, n)
+	copy(out, b[:n])
+	return out
 }
 
 // sizeBucket coarsens length so that +/- a few bytes of per-request noise
