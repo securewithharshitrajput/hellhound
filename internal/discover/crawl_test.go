@@ -180,3 +180,25 @@ func TestCrawlHandlesLinkCycles(t *testing.T) {
 		t.Fatal("Crawl did not terminate on a cyclic link graph within 5s")
 	}
 }
+
+func TestWordsFromCrawl(t *testing.T) {
+	results := []CrawlResult{
+		{URL: "http://t/api/v2/billing-export"},
+		{URL: "http://t/about"},
+		{URL: "http://t/static/app.js"}, // app.js has a dot -> skipped as a leaf asset
+		{URL: "http://t/api/v2/users"},  // "api","v2" already seen; "users" new
+	}
+	got := WordsFromCrawl(results)
+	want := map[string]bool{"api": true, "v2": true, "billing-export": true, "about": true, "static": true, "users": true}
+	if len(got) != len(want) {
+		t.Fatalf("got %v (%d), want %d distinct segments", got, len(got), len(want))
+	}
+	for _, g := range got {
+		if !want[g] {
+			t.Errorf("unexpected segment %q", g)
+		}
+		if g == "app.js" {
+			t.Errorf("file-like segment app.js should have been skipped")
+		}
+	}
+}

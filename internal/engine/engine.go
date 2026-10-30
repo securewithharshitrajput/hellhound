@@ -139,7 +139,7 @@ func DefaultConfig() Config {
 		Timeout:            10 * time.Second,
 		FollowRedirect:     false,
 		MaxBodyBytes:       512 * 1024,
-		UserAgent:          "hellhound/0.4 (+authorized-testing)",
+		UserAgent:          "hellhound/0.5 (+authorized-testing)",
 		RetryOn429:         true,
 		InsecureSkipVerify: false,
 	}

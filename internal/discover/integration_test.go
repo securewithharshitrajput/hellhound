@@ -6,9 +6,11 @@ package discover
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -292,5 +294,74 @@ func TestEmptyWordlistDoesNotPanic(t *testing.T) {
 	}
 	if len(results) != 0 {
 		t.Errorf("expected 0 results with an empty wordlist, got %d", len(results))
+	}
+}
+
+// TestMidScanDriftRecoversFromBlocking simulates the real Vercel failure:
+// a target that behaves normally at first (distinct dynamic soft-404s,
+// each with a different echoed path) then, after a request threshold,
+// starts serving ONE identical "Security Checkpoint" block page to
+// everything. Without drift handling, every blocked path reads as a new
+// finding and the report floods. With it, the scan detects the implausible
+// hit-rate spike, re-calibrates against the target's new behavior, and
+// drops the block-page findings — leaving only genuinely distinct results
+// (here: /realhit, served real content before blocking began).
+func TestMidScanDriftRecoversFromBlocking(t *testing.T) {
+	var count atomic.Int64
+	const blockAfter = 40
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := count.Add(1)
+		if r.URL.Path == "/realhit" {
+			w.Write([]byte("<html><body><h1>Genuine unique content for the real hit</h1></body></html>"))
+			return
+		}
+		if n > blockAfter {
+			// Identical challenge page for every path, regardless of path.
+			w.Write([]byte(`<html><body><h1>Security Checkpoint</h1><p>Verifying your browser before access. Please enable JavaScript.</p></body></html>`))
+			return
+		}
+		// Normal dynamic soft-404 phase.
+		w.Write([]byte("<html><body>Not found: " + r.URL.Path + " (ref " + r.URL.Path + ")</body></html>"))
+	}))
+	defer srv.Close()
+
+	// A wordlist large enough to cross blockAfter and give a meaningful
+	// sample for the drift check (>= driftMinSample).
+	words := []string{"realhit"}
+	for i := 0; i < 200; i++ {
+		words = append(words, fmt.Sprintf("word%03d", i))
+	}
+
+	var warnings []string
+	d := New(testEngine(), Options{
+		BaseURL:      srv.URL,
+		Wordlist:     words,
+		CalibrationN: 6,
+		MaxDepth:     0,
+		OnWarning:    func(dir string, err error) { warnings = append(warnings, err.Error()) },
+	})
+	results, err := d.Run(context.Background(), "/")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// The block-page flood must be gone — far fewer than the ~160 blocked
+	// paths that would otherwise be reported.
+	if len(results) > 10 {
+		t.Errorf("expected drift recovery to suppress the block-page flood, still got %d findings", len(results))
+	}
+	// The genuine hit must survive (its content is distinct from the block page).
+	foundReal := false
+	for _, r := range results {
+		if r.URL == srv.URL+"/realhit" {
+			foundReal = true
+		}
+	}
+	if !foundReal {
+		t.Errorf("drift recovery wrongly dropped the genuine /realhit finding; results: %v", resultURLs(results))
+	}
+	// And it must have warned the operator that it happened.
+	if len(warnings) == 0 {
+		t.Error("expected a drift warning, got none")
 	}
 }

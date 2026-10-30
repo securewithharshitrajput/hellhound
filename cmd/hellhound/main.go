@@ -12,6 +12,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -51,7 +52,9 @@ func main() {
 		depth        = flag.Int("depth", 2, "max recursion depth")
 		calibN       = flag.Int("calibrate", 6, "calibration probes per directory")
 		extStr       = flag.String("ext", "", "comma-separated extensions to try, e.g. .php,.bak,.old")
-		jsonOut      = flag.String("json", "", "write full JSON report to this path")
+		jsonOut      = flag.String("json", "", "write the full clustered JSON report to this path")
+		csvOut       = flag.String("csv", "", "write findings as CSV to this path (one row per finding)")
+		sarifOut     = flag.String("sarif", "", "write findings as SARIF 2.1.0 to this path (for CI / GitHub code scanning)")
 		timeout      = flag.Duration("timeout", 10*time.Second, "per-request timeout")
 		insecure     = flag.Bool("k", false, "skip TLS certificate verification (only for authorized testing of a target with a self-signed/dev cert)")
 		noMine       = flag.Bool("no-mine", false, "skip mining robots.txt/homepage/JS for target-derived wordlist words")
@@ -118,6 +121,23 @@ func main() {
 		}
 	}
 
+	// Crawl runs BEFORE fuzzing (when enabled) so its discoveries feed the
+	// fuzz wordlist: a path segment the crawler reached by following a real
+	// link becomes a word the fuzzer then tries in every directory. The two
+	// phases reinforce each other instead of running independently — and
+	// because a crawl-found page's segments are now fuzzed, those pages also
+	// land in the structured report/output files, not just the [crawl] text.
+	if ctx.Err() == nil && *crawl {
+		crawlResults := runCrawl(ctx, eng, baseURL, *crawlDepth, *crawlMax)
+		if cw := discover.WordsFromCrawl(crawlResults); len(cw) > 0 {
+			before := len(words)
+			words = wordlist.Merge(words, cw)
+			if added := len(words) - before; added > 0 {
+				fmt.Fprintf(os.Stderr, "hellhound: crawl contributed %d new fuzz word(s)\n", added)
+			}
+		}
+	}
+
 	exts := []string{""}
 	if *extStr != "" {
 		for _, e := range strings.Split(*extStr, ",") {
@@ -167,23 +187,29 @@ func main() {
 		runVHostScan(ctx, eng, baseURL, *vhostFile, *calibN)
 	}
 
-	if ctx.Err() == nil && *crawl {
-		runCrawl(ctx, eng, baseURL, *crawlDepth, *crawlMax)
-	}
+	writeOutput("JSON", *jsonOut, rep, report.WriteJSON)
+	writeOutput("CSV", *csvOut, rep, report.WriteCSV)
+	writeOutput("SARIF", *sarifOut, rep, report.WriteSARIF)
+}
 
-	if *jsonOut != "" {
-		f, err := os.Create(*jsonOut)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "hellhound: could not write JSON report: %v\n", err)
-			os.Exit(1)
-		}
-		defer f.Close()
-		if err := report.WriteJSON(f, rep); err != nil {
-			fmt.Fprintf(os.Stderr, "hellhound: error encoding JSON report: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Fprintf(os.Stderr, "\nhellhound: wrote full JSON report to %s\n", *jsonOut)
+// writeOutput writes rep to path using the given format writer, exiting on
+// any error. A no-op when path is empty, so each -json/-csv/-sarif flag is
+// independent and any combination can be produced in one run.
+func writeOutput(label, path string, rep report.JSONReport, write func(io.Writer, report.JSONReport) error) {
+	if path == "" {
+		return
 	}
+	f, err := os.Create(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hellhound: could not write %s report: %v\n", label, err)
+		os.Exit(1)
+	}
+	defer f.Close()
+	if err := write(f, rep); err != nil {
+		fmt.Fprintf(os.Stderr, "hellhound: error encoding %s report: %v\n", label, err)
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stderr, "hellhound: wrote %s report to %s\n", label, path)
 }
 
 // runAPIDiscovery actively probes conventional OpenAPI/Swagger and GraphQL
@@ -309,7 +335,7 @@ func runVHostScan(ctx context.Context, eng *engine.Engine, baseURL, vhostFile st
 // runCrawl follows real links from the target to surface pages no wordlist
 // could guess — the one job a pure fuzzer structurally can't do, and the
 // gap this closes versus katana.
-func runCrawl(ctx context.Context, eng *engine.Engine, baseURL string, depth, maxPages int) {
+func runCrawl(ctx context.Context, eng *engine.Engine, baseURL string, depth, maxPages int) []discover.CrawlResult {
 	start := time.Now()
 	fmt.Fprintf(os.Stderr, "\nhellhound: crawling %s for linked pages (max depth %d, max %d pages)...\n", baseURL, depth, maxPages)
 	results := discover.Crawl(ctx, eng, baseURL, depth, maxPages)
@@ -322,6 +348,7 @@ func runCrawl(ctx context.Context, eng *engine.Engine, baseURL string, depth, ma
 		}
 	}
 	fmt.Fprintf(os.Stderr, "hellhound: crawl done in %s\n", time.Since(start).Round(time.Millisecond))
+	return results
 }
 
 func loadWordlistFile(path string) []string {

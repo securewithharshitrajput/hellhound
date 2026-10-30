@@ -197,6 +197,15 @@ func Hamming(a, b uint64) int {
 	return bits.OnesCount64(a ^ b)
 }
 
+// SimilarShape reports whether two SimHash fingerprints are within the
+// Calibrator's own near-identical threshold. Exported so other phases
+// (e.g. mid-scan drift re-filtering in the discover package) can judge
+// "same template" using the exact same cutoff the calibrator does, rather
+// than hardcoding a threshold that could drift out of sync.
+func SimilarShape(a, b uint64) bool {
+	return Hamming(a, b) <= simThreshold
+}
+
 func fnvHash(b []byte) uint64 {
 	h := fnv.New64a()
 	h.Write(b)

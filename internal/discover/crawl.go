@@ -151,3 +151,32 @@ func extractLinks(body []byte) []string {
 	}
 	return out
 }
+
+// WordsFromCrawl turns crawl results into fuzz-word candidates: every path
+// SEGMENT of every discovered URL (e.g. "/api/v2/billing-export" ->
+// "api", "v2", "billing-export"), deduplicated. This is the crawl->fuzz
+// feedback loop — a path the crawler found by following a real link (an
+// unguessable slug, a real API version, an internal section name) becomes
+// a word the fuzzer then tries in EVERY directory, so the two phases
+// reinforce each other instead of running blind to one another. File-like
+// final segments (anything with a ".") are skipped: "app.js" is a leaf
+// asset, not a useful fuzz word, and its stem rarely generalizes.
+func WordsFromCrawl(results []CrawlResult) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, r := range results {
+		u, err := url.Parse(r.URL)
+		if err != nil {
+			continue
+		}
+		for _, seg := range strings.Split(strings.Trim(u.Path, "/"), "/") {
+			seg = strings.TrimSpace(seg)
+			if seg == "" || strings.Contains(seg, ".") || seen[seg] {
+				continue
+			}
+			seen[seg] = true
+			out = append(out, seg)
+		}
+	}
+	return out
+}

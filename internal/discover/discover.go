@@ -173,7 +173,9 @@ func (d *Discoverer) scanDir(ctx context.Context, dir string, depth int) ([]Resu
 	}()
 
 	var results []Result
+	total := 0
 	for resp := range d.eng.Run(ctx, reqs) {
+		total++
 		path, _ := resp.Req.Meta.(string)
 		v := d.cal.Classify(dir, path, resp)
 		if !v.Interesting {
@@ -191,7 +193,89 @@ func (d *Discoverer) scanDir(ctx context.Context, dir string, depth int) ([]Resu
 			Verdict:     v,
 		})
 	}
+
+	results = d.recalibrateIfDrifted(ctx, dir, results, total)
 	return results, nil
+}
+
+const (
+	// driftMinSample is how many candidates must be classified before the
+	// hit-rate drift check is meaningful (too few and the ratio is noise).
+	driftMinSample = 100
+	// driftHitRate is the fraction of candidates classified "interesting"
+	// above which we suspect the target changed behavior mid-scan (started
+	// serving a bot-challenge / WAF block / wildcard page to everything).
+	// Real content discovery hit rates are a fraction of a percent; 30% is
+	// so far beyond plausible that it unambiguously means "the baseline
+	// learned up front no longer describes what the target is returning."
+	driftHitRate = 0.30
+)
+
+// recalibrateIfDrifted defends against a target that changes behavior
+// partway through a scan — the exact failure seen live against a
+// Vercel-hosted site, where bot-mitigation escalated after the first burst
+// of requests and every subsequent path returned an identical "Security
+// Checkpoint" challenge page. The up-front calibration can't know about a
+// change that happens later, so everything after it looks like a brand-new
+// finding and the report floods.
+//
+// When the hit rate for a directory is implausibly high, it re-calibrates
+// RIGHT NOW (fresh probes capture the target's *current* behavior) and
+// drops any collected finding whose shape matches that fresh baseline —
+// i.e. anything that is really just the new block/challenge page. Findings
+// from before the drift that are genuinely distinct from the new baseline
+// survive. It compares via stored SimHash fingerprints (Verdict.ClusterKey)
+// so it needs no response bodies and sends no extra requests beyond the
+// handful of fresh probes — it will not re-hammer an already-struggling
+// target.
+func (d *Discoverer) recalibrateIfDrifted(ctx context.Context, dir string, results []Result, total int) []Result {
+	if total < driftMinSample || len(results) == 0 {
+		return results
+	}
+	if float64(len(results))/float64(total) <= driftHitRate {
+		return results
+	}
+
+	n := d.opts.CalibrationN
+	reqs := make([]engine.Request, n)
+	tokens := make([]string, n)
+	for i := range reqs {
+		tok := analyze.RandomToken()
+		tokens[i] = tok
+		reqs[i] = engine.Request{Method: "GET", URL: d.opts.BaseURL + joinDir(dir, tok)}
+	}
+	var freshHashes []uint64
+	for i, r := range d.eng.DoAll(ctx, reqs) {
+		if r.Err != nil {
+			continue
+		}
+		freshHashes = append(freshHashes, analyze.SimHash(r.Body, joinDir(dir, tokens[i]), tokens[i]))
+	}
+	if len(freshHashes) == 0 {
+		return results // couldn't re-probe; leave results untouched
+	}
+
+	kept := results[:0]
+	dropped := 0
+	for _, res := range results {
+		matchesNewBaseline := false
+		for _, fh := range freshHashes {
+			if analyze.SimilarShape(fh, res.Verdict.ClusterKey) {
+				matchesNewBaseline = true
+				break
+			}
+		}
+		if matchesNewBaseline {
+			dropped++
+			continue
+		}
+		kept = append(kept, res)
+	}
+	if dropped > 0 {
+		pct := 100 * float64(len(results)) / float64(total)
+		d.opts.OnWarning(dir, fmt.Errorf("hit rate %.0f%% is implausibly high — target likely began serving a block/challenge/wildcard page mid-scan; re-calibrated and dropped %d finding(s) that match the target's new behavior", pct, dropped))
+	}
+	return kept
 }
 
 // prioritizeRecursion decides which hits are worth recursing into. Rather

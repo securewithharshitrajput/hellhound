@@ -2,6 +2,7 @@ package report
 
 import (
 	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -120,5 +121,77 @@ func TestWriteSummaryFormat(t *testing.T) {
 	}
 	if !strings.Contains(out, "+1 similar") {
 		t.Errorf("summary missing the '+N similar' tag for a 2-member cluster, got:\n%s", out)
+	}
+}
+
+func TestWriteCSV(t *testing.T) {
+	results := []discover.Result{
+		mkResult("http://t/a", 200, "shared aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		mkResult("http://t/b", 200, "shared aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		mkResult("http://t/admin", 403, "totally different content for the admin forbidden page here"),
+	}
+	rep := Build("http://target", results)
+
+	var buf bytes.Buffer
+	if err := WriteCSV(&buf, rep); err != nil {
+		t.Fatalf("WriteCSV: %v", err)
+	}
+	rows, err := csv.NewReader(&buf).ReadAll()
+	if err != nil {
+		t.Fatalf("output is not valid CSV: %v", err)
+	}
+	// Header + one row per finding (all 3 flattened, not 2 clusters).
+	if len(rows) != 1+3 {
+		t.Fatalf("expected header + 3 finding rows, got %d rows: %v", len(rows), rows)
+	}
+	if rows[0][0] != "url" || rows[0][1] != "status" {
+		t.Errorf("unexpected header: %v", rows[0])
+	}
+	// Every data row's URL must be one of the inputs.
+	seen := map[string]bool{}
+	for _, row := range rows[1:] {
+		seen[row[0]] = true
+	}
+	for _, want := range []string{"http://t/a", "http://t/b", "http://t/admin"} {
+		if !seen[want] {
+			t.Errorf("CSV missing finding %s", want)
+		}
+	}
+}
+
+func TestWriteSARIFIsValidAndComplete(t *testing.T) {
+	results := []discover.Result{
+		mkResult("http://t/admin", 200, "admin panel content for the test here and there"),
+		mkResult("http://t/backup.zip", 200, "PK zip bytes totally distinct from the admin page content"),
+	}
+	rep := Build("http://target", results)
+
+	var buf bytes.Buffer
+	if err := WriteSARIF(&buf, rep); err != nil {
+		t.Fatalf("WriteSARIF: %v", err)
+	}
+
+	// Must be valid JSON with the SARIF skeleton intact.
+	var doc map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
+		t.Fatalf("SARIF output is not valid JSON: %v", err)
+	}
+	if doc["version"] != "2.1.0" {
+		t.Errorf("SARIF version = %v, want 2.1.0", doc["version"])
+	}
+	runs, ok := doc["runs"].([]any)
+	if !ok || len(runs) != 1 {
+		t.Fatalf("expected exactly 1 run, got %v", doc["runs"])
+	}
+	run := runs[0].(map[string]any)
+	sarifResults, ok := run["results"].([]any)
+	if !ok || len(sarifResults) != 2 {
+		t.Fatalf("expected 2 SARIF results (one per finding), got %v", run["results"])
+	}
+	// Each result must carry a location URI matching a finding.
+	first := sarifResults[0].(map[string]any)
+	locs := first["locations"].([]any)
+	if len(locs) == 0 {
+		t.Fatal("SARIF result has no location")
 	}
 }

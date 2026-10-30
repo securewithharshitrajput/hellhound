@@ -31,7 +31,9 @@ Pure brute force (ffuf) and pure crawling (katana) both treat every endpoint the
 | Wordlist | Static, supplied by you | **Mined from the target itself** — robots.txt, linked JS, tech fingerprinting |
 | API surface | Guessed path by path | **Reads the target's own OpenAPI/Swagger spec or GraphQL schema directly** when exposed — one hit yields the entire route map |
 | Virtual hosts | Not covered | **Calibrated Host-header fuzzing** finds internal vhosts DNS never advertised |
-| Link crawling | katana crawls, ffuf can't | **Both**: calibrated fuzzing *and* same-origin multi-hop crawling (`-crawl`) — reaches pages that are only linked (a random slug, an internal report) which no wordlist can guess |
+| Link crawling | katana crawls, ffuf can't | **Both, and they feed each other**: calibrated fuzzing *and* same-origin multi-hop crawling (`-crawl`) — a page reached by following a link also seeds the fuzz wordlist, so each phase strengthens the other |
+| Mid-scan blocking | floods findings when a WAF/bot-wall kicks in partway | **Detects the hit-rate spike, re-calibrates against the target's new behavior, and drops the block-page flood** — the Vercel failure, handled automatically |
+| Output | text / JSON | text, JSON, **CSV, and SARIF 2.1.0** (CI / GitHub code scanning) |
 | Engagement fit | ffuf has `-x`/`-rate`; katana limited | **Proxy (`-x`) for Burp/ZAP + true requests/sec rate limit (`-rate`)** to stay under WAF/bot thresholds |
 | Resilience | — | Survives WAF deny pages, redirect-everything proxies, dead targets, and malformed input *by design*, not by luck (see [Testing](#testing)) |
 
@@ -63,10 +65,10 @@ flowchart LR
 ## Install
 
 ```bash
-go install github.com/securewithharshitrajput/hellhound/cmd/hellhound@v0.4.0
+go install github.com/securewithharshitrajput/hellhound/cmd/hellhound@v0.5.0
 ```
 
-(Pin to a tagged version like `@v0.4.0` rather than `@latest` — Go's module proxy caches version lookups, and `@latest` against an untagged commit can serve a stale result until the proxy's cache naturally refreshes. A tagged release doesn't have that problem.)
+(Pin to a tagged version like `@v0.5.0` rather than `@latest` — Go's module proxy caches version lookups, and `@latest` against an untagged commit can serve a stale result until the proxy's cache naturally refreshes. A tagged release doesn't have that problem.)
 
 This drops a `hellhound` binary into `$(go env GOBIN)` (usually `~/go/bin`) — the same place `ffuf`/`katana` live. Make sure that's on your `PATH` and you're done:
 
@@ -105,8 +107,8 @@ hellhound -u https://target.tld -x http://127.0.0.1:8080 -k -rate 20
 # Authenticated scan behind an auth header, self-signed dev cert
 hellhound -u https://staging.internal -H "Authorization: Bearer <token>" -k
 
-# Save full structured output for other tooling
-hellhound -u http://target.tld -json results.json
+# Save structured output — JSON, CSV, and SARIF (for CI code scanning) at once
+hellhound -u http://target.tld -json out.json -csv out.csv -sarif out.sarif
 ```
 
 Sample run:
@@ -162,7 +164,9 @@ The banner at the top is randomized per run (Metasploit-style rotating tips) and
 | `-crawl-max` | `500` | Max total pages to fetch when `-crawl` is set |
 | `-no-mine` | `false` | Skip mining robots.txt/homepage/JS for target-derived words |
 | `-no-banner` | `false` | Suppress the startup banner |
-| `-json` | — | Write the full structured report to this path |
+| `-json` | — | Write the full clustered JSON report to this path |
+| `-csv` | — | Write findings as CSV (one row per finding) to this path |
+| `-sarif` | — | Write findings as SARIF 2.1.0 to this path (for CI / GitHub code scanning) |
 
 ---
 
