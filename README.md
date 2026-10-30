@@ -8,15 +8,15 @@
 ██   ██  ███████  ███████  ███████  ██   ██  ███████  ███████  ██   ██  ██████
 ```
 
-**Calibrated recon that hunts instead of guessing.**
+**Calibrated recon that hunts, finds, and classifies what actually matters.**
 
 [![Go Version](https://img.shields.io/badge/Go-1.21%2B-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-51%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-100%2B%20passing-brightgreen)](#testing)
 [![Fuzz Tested](https://img.shields.io/badge/fuzz--tested-yes-blueviolet)](#testing)
 [![Status: authorized testing only](https://img.shields.io/badge/use-authorized%20testing%20only-critical)](#legal--ethics)
 
-`ffuf` fuzzes. `katana` crawls. **Hellhound calibrates, hunts, and tells you what actually matters** — auto-learning what "not found" looks like on *this specific target* before it ever reports a single finding, so you read a handful of real hits instead of hand-tuning `-fc`/`-fs` against a wall of noise.
+`ffuf` fuzzes. `katana` crawls. **Hellhound calibrates, hunts, classifies, and tells you what's actually dangerous** — it auto-learns what "not found" looks like on *this specific target* so you read a handful of real hits instead of hand-tuning `-fc`/`-fs` against a wall of noise, and then it labels the dangerous ones: `[HIGH]` on an exposed `.env` or `.git/config`, `[MEDIUM]` on an open-redirect or dir-listing, `[LOW]` on `Server: nginx/1.21.3`.
 
 ---
 
@@ -33,7 +33,9 @@ Pure brute force (ffuf) and pure crawling (katana) both treat every endpoint the
 | Virtual hosts | Not covered | **Calibrated Host-header fuzzing** finds internal vhosts DNS never advertised |
 | Link crawling | katana crawls, ffuf can't | **Both, and they feed each other**: calibrated fuzzing *and* same-origin multi-hop crawling (`-crawl`) — a page reached by following a link also seeds the fuzz wordlist, so each phase strengthens the other |
 | Mid-scan blocking | floods findings when a WAF/bot-wall kicks in partway | **Detects the hit-rate spike, re-calibrates against the target's new behavior, and drops the block-page flood** — the Vercel failure, handled automatically |
-| Output | text / JSON | text, JSON, **CSV, and SARIF 2.1.0** (CI / GitHub code scanning) |
+| **Dangerous classification** | discovers endpoints and stops | **Tier-A security checks**: exposed `.env` / `.git/config` / backup SQL / private keys (HIGH), directory listings, open-redirects, dangerous HTTP methods (OPTIONS → PUT/DELETE/PATCH/TRACE) (MEDIUM), framework-version headers (LOW) — findings land in the same report with severity labels so you triage the dangerous stuff first |
+| **Tech-aware wordlists** | one static list for every target | **Auto-detects the stack** (WordPress, Drupal, Joomla, Django, Rails, Laravel, Spring Boot, ASP.NET, PHP, Node) from one homepage fetch, then injects a curated path list for each (e.g. `/actuator/*` for Spring, `/rails/info/routes` for Rails, `wp-admin` / `xmlrpc.php` for WordPress) |
+| Output | text / JSON | text, JSON, **CSV, and SARIF 2.1.0** (CI / GitHub code scanning) — SARIF rules split per finding type so a GitHub dashboard shows the real problems in red, discovery noise in gray |
 | Engagement fit | ffuf has `-x`/`-rate`; katana limited | **Proxy (`-x`) for Burp/ZAP + true requests/sec rate limit (`-rate`)** to stay under WAF/bot thresholds |
 | Resilience | — | Survives WAF deny pages, redirect-everything proxies, dead targets, and malformed input *by design*, not by luck (see [Testing](#testing)) |
 
@@ -65,10 +67,10 @@ flowchart LR
 ## Install
 
 ```bash
-go install github.com/securewithharshitrajput/hellhound/cmd/hellhound@v0.5.0
+go install github.com/securewithharshitrajput/hellhound/cmd/hellhound@v0.6.0
 ```
 
-(Pin to a tagged version like `@v0.5.0` rather than `@latest` — Go's module proxy caches version lookups, and `@latest` against an untagged commit can serve a stale result until the proxy's cache naturally refreshes. A tagged release doesn't have that problem.)
+(Pin to a tagged version like `@v0.6.0` rather than `@latest` — Go's module proxy caches version lookups, and `@latest` against an untagged commit can serve a stale result until the proxy's cache naturally refreshes. A tagged release doesn't have that problem.)
 
 This drops a `hellhound` binary into `$(go env GOBIN)` (usually `~/go/bin`) — the same place `ffuf`/`katana` live. Make sure that's on your `PATH` and you're done:
 
@@ -116,14 +118,36 @@ Sample run:
 ```
 hellhound: mining robots.txt + homepage + linked JS for target-derived words...
 hellhound: mined 3 additional word(s) from the target itself
-hellhound: calibrating + scanning http://target.tld with 91 words x 2 extensions (depth=2, concurrency=40)
-hellhound: done in 583ms, sent 10907 requests (0 backoff pauses)
+hellhound: detected stack(s): wordpress, php
+hellhound: injected 24 tech-specific word(s)
+hellhound: calibrating + scanning http://target.tld with 115 words x 2 extensions (depth=2, concurrency=40)
+hellhound: done in 591ms, sent 13208 requests (0 backoff pauses)
+
+hellhound: running Tier-A security checks (sensitive files, dir listings, dangerous methods, open-redirect, info-disclosure)...
+hellhound: security checks done in 94ms — 6 finding(s)
 
 hellhound: 21 findings in 9 cluster(s) for http://target.tld
 
   [200] http://target.tld/admin/users                    len=88     status 200 does not match any calibrated baseline shape
-  [200] http://target.tld/api/internal/billing-export     len=104    status 200 does not match any calibrated baseline shape (+2 similar)
-  [200] http://target.tld/swagger.json                    len=117    status 200 does not match any calibrated baseline shape
+  [200] http://target.tld/api/internal/billing-export    len=104    status 200 does not match any calibrated baseline shape (+2 similar)
+  [200] http://target.tld/swagger.json                   len=117    status 200 does not match any calibrated baseline shape
+
+[security] 6 finding(s):
+  [HIGH  ] sensitive-file  http://target.tld/.env
+        environment file commonly contains database and API credentials
+        evidence: DB_PASSWORD=hunter2 SECRET_KEY=abc...
+  [HIGH  ] sensitive-file  http://target.tld/.git/config
+        .git directory exposed — attacker can reconstruct full source tree
+        evidence: [core]  repositoryformatversion = 0 [remote "o
+  [MEDIUM] dangerous-methods  http://target.tld/api/users
+        server advertises PUT, DELETE, PATCH via OPTIONS Allow header
+        evidence: GET, POST, PUT, DELETE, PATCH, OPTIONS
+  [MEDIUM] dir-listing  http://target.tld/uploads/
+        directory listing enabled — every filename in this directory is enumerable
+  [MEDIUM] open-redirect  http://target.tld/go?url=https://legit.example.com/
+        parameter url is reflected into the Location header without validation
+  [LOW   ] info-disclosure  http://target.tld
+        Server header exposes server software and version: nginx/1.21.3
 
 [openapi] spec found at /swagger.json — 5 routes declared:
     GET     /orders
@@ -163,10 +187,24 @@ The banner at the top is randomized per run (Metasploit-style rotating tips) and
 | `-crawl-depth` | `3` | Max link-following depth when `-crawl` is set |
 | `-crawl-max` | `500` | Max total pages to fetch when `-crawl` is set |
 | `-no-mine` | `false` | Skip mining robots.txt/homepage/JS for target-derived words |
+| `-no-tech` | `false` | Skip tech-stack fingerprinting + tech-specific wordlist injection |
+| `-no-security` | `false` | Skip Tier-A security checks (sensitive files, dir listing, dangerous HTTP methods, open-redirect, info-disclosure headers) |
 | `-no-banner` | `false` | Suppress the startup banner |
-| `-json` | — | Write the full clustered JSON report to this path |
-| `-csv` | — | Write findings as CSV (one row per finding) to this path |
+| `-json` | — | Write the full clustered JSON report (incl. security findings) to this path |
+| `-csv` | — | Write findings as CSV (one row per finding, security findings tagged `security`) to this path |
 | `-sarif` | — | Write findings as SARIF 2.1.0 to this path (for CI / GitHub code scanning) |
+
+### Tier-A security findings
+
+Hellhound classifies each endpoint it discovers against a dedicated set of security probes and content checks. Everything that triggers lands in the `[security]` block of stdout and (with their severity preserved) in the JSON/CSV/SARIF outputs. The checks are:
+
+| Check | What it looks for | Typical severity |
+|---|---|---|
+| **sensitive-file** | `.env`, `.git/config`, `.htpasswd`, `backup.sql`, `/id_rsa`, `wp-config.php.bak`, Terraform state, `/credentials.json`, 40+ well-known dangerous paths — each confirmed by content markers (no soft-404 false positives) | HIGH |
+| **dir-listing** | Response body matches Apache/nginx/Python-SimpleHTTPServer's directory-index fingerprint — every filename enumerable, non-linked backups exposed | MEDIUM |
+| **dangerous-methods** | `OPTIONS` on each discovered endpoint; flags any `Allow:` header advertising `PUT` / `DELETE` / `PATCH` (MEDIUM) or `TRACE` alone (LOW, XST primitive) | MEDIUM / LOW |
+| **open-redirect** | Any discovered URL whose query carries a redirect-shaped parameter (`url`, `next`, `redirect`, `redirect_uri`, `goto`, `return`, `callback`, …) is re-sent with a canary external URL; a 3xx `Location:` reflecting it is flagged | MEDIUM |
+| **info-disclosure** | `Server`, `X-Powered-By`, `X-AspNet-Version`, `X-Rails-Version`, `X-Generator`, `X-Application-Context`, etc. — deduplicated per host so a 10,000-request scan doesn't flood with the same banner | LOW / INFO |
 
 ---
 
@@ -181,7 +219,7 @@ This isn't "it compiled, ship it." The analyzer and engine were deliberately put
 - **50,000-word stress test** against a live server — found and fixed a ~0.1% false-positive edge case in redaction ordering
 - **Goroutine leak checks** across repeated scans
 
-51 tests passing, `go vet` and `gofmt` clean, zero known crashes.
+100+ tests passing (every new Tier-A detector carries its own fingerprint and false-positive-rejection regression tests), `go vet` and `gofmt` clean, zero known crashes.
 
 ```bash
 go test ./...

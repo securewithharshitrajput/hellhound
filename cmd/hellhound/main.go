@@ -66,6 +66,8 @@ func main() {
 		crawlDepth   = flag.Int("crawl-depth", 3, "max link-following depth when -crawl is set")
 		crawlMax     = flag.Int("crawl-max", 500, "max total pages to fetch when -crawl is set")
 		noBanner     = flag.Bool("no-banner", false, "suppress the startup banner")
+		noSecurity   = flag.Bool("no-security", false, "skip Tier-A security checks (sensitive files, dir listing, dangerous HTTP methods, open-redirect, info-disclosure headers)")
+		noTechMine   = flag.Bool("no-tech", false, "skip tech-stack fingerprinting + tech-specific wordlist injection (WordPress/Django/Rails/Laravel/Spring/etc.)")
 	)
 	flag.Var(headers, "H", `custom header, repeatable, format "Name: value" (e.g. -H "Authorization: Bearer xyz")`)
 	flag.Parse()
@@ -121,14 +123,37 @@ func main() {
 		}
 	}
 
+	// Tech fingerprinting + smart wordlist injection. One homepage fetch,
+	// then zero further cost — the detected stacks' curated path lists just
+	// merge into the wordlist the main fuzz loop will use.
+	var detectedTechs []discover.Tech
+	if ctx.Err() == nil && !*noTechMine {
+		detectedTechs = discover.DetectTech(ctx, eng, baseURL)
+		if len(detectedTechs) > 0 {
+			names := make([]string, len(detectedTechs))
+			for i, t := range detectedTechs {
+				names[i] = string(t)
+			}
+			fmt.Fprintf(os.Stderr, "hellhound: detected stack(s): %s\n", strings.Join(names, ", "))
+			if tw := discover.WordsForTechs(detectedTechs); len(tw) > 0 {
+				before := len(words)
+				words = wordlist.Merge(words, tw)
+				if added := len(words) - before; added > 0 {
+					fmt.Fprintf(os.Stderr, "hellhound: injected %d tech-specific word(s)\n", added)
+				}
+			}
+		}
+	}
+
 	// Crawl runs BEFORE fuzzing (when enabled) so its discoveries feed the
 	// fuzz wordlist: a path segment the crawler reached by following a real
 	// link becomes a word the fuzzer then tries in every directory. The two
 	// phases reinforce each other instead of running independently — and
 	// because a crawl-found page's segments are now fuzzed, those pages also
 	// land in the structured report/output files, not just the [crawl] text.
+	var crawlResults []discover.CrawlResult
 	if ctx.Err() == nil && *crawl {
-		crawlResults := runCrawl(ctx, eng, baseURL, *crawlDepth, *crawlMax)
+		crawlResults = runCrawl(ctx, eng, baseURL, *crawlDepth, *crawlMax)
 		if cw := discover.WordsFromCrawl(crawlResults); len(cw) > 0 {
 			before := len(words)
 			words = wordlist.Merge(words, cw)
@@ -177,6 +202,21 @@ func main() {
 	}
 
 	rep := report.Build(*target, results)
+
+	// Tier-A security phases. Each one is independent and skippable; the
+	// combined findings land in the same report so stdout/CSV/SARIF all
+	// surface them uniformly. These phases DO issue extra requests (sensitive
+	// probes + per-discovered-endpoint OPTIONS + per-redirect-param probe), so
+	// -no-security turns the whole thing off for a pure discovery run.
+	// Both fuzz-discovered AND crawl-discovered URLs are classified — a page
+	// reached only by following a link still deserves open-redirect/method
+	// checks and still leaks headers worth capturing.
+	if !*noSecurity && ctx.Err() == nil {
+		allResults := append([]discover.Result{}, results...)
+		allResults = append(allResults, discover.AsResults(crawlResults)...)
+		rep.SecurityFindings = append(rep.SecurityFindings, runSecurityScans(ctx, eng, baseURL, allResults)...)
+	}
+
 	report.WriteSummary(os.Stdout, rep)
 
 	if ctx.Err() == nil {
@@ -190,6 +230,42 @@ func main() {
 	writeOutput("JSON", *jsonOut, rep, report.WriteJSON)
 	writeOutput("CSV", *csvOut, rep, report.WriteCSV)
 	writeOutput("SARIF", *sarifOut, rep, report.WriteSARIF)
+}
+
+// runSecurityScans runs every Tier-A detector concurrently and merges the
+// findings. Order of lines in stderr is not critical; findings land in the
+// returned slice with their severities intact so the reporter can sort.
+func runSecurityScans(ctx context.Context, eng *engine.Engine, baseURL string, results []discover.Result) []discover.SecurityFinding {
+	start := time.Now()
+	fmt.Fprintf(os.Stderr, "\nhellhound: running Tier-A security checks (sensitive files, dir listings, dangerous methods, open-redirect, info-disclosure)...\n")
+
+	var findings []discover.SecurityFinding
+
+	// 1) Sensitive file probes (dedicated path list, concurrent batch).
+	findings = append(findings, discover.ScanSensitive(ctx, eng, baseURL)...)
+
+	// 2) Dir-listing classification (zero extra requests, uses already-captured bodies).
+	findings = append(findings, discover.ClassifyDirListings(results)...)
+
+	// 3) Info-disclosure header capture (zero extra requests, uses already-captured headers).
+	findings = append(findings, discover.CaptureInfoDisclosure(results)...)
+
+	// 4) Dangerous HTTP methods (one OPTIONS per unique discovered URL).
+	urls := make([]string, 0, len(results))
+	for _, r := range results {
+		if r.Status >= 200 && r.Status < 400 {
+			urls = append(urls, r.URL)
+		}
+	}
+	findings = append(findings, discover.ScanDangerousMethods(ctx, eng, urls)...)
+
+	// 5) Open-redirect classification (probes any discovered URL carrying a
+	// redirect-shaped parameter — most discovered URLs have no query string,
+	// so the extra request volume is small).
+	findings = append(findings, discover.ScanOpenRedirects(ctx, eng, urls)...)
+
+	fmt.Fprintf(os.Stderr, "hellhound: security checks done in %s — %d finding(s)\n", time.Since(start).Round(time.Millisecond), len(findings))
+	return findings
 }
 
 // writeOutput writes rep to path using the given format writer, exiting on

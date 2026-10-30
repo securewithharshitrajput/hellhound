@@ -24,10 +24,30 @@ var linkAttrRe = regexp.MustCompile(`(?i)(?:href|src|action)\s*=\s*["']([^"'<>]+
 
 // CrawlResult is one URL reached by following real links, with the HTTP
 // status it returned and the link-depth at which it was discovered.
+// BodyPreview and Headers mirror discover.Result so Tier-A security phases
+// (dir-listing, info-disclosure) can classify crawled pages uniformly.
 type CrawlResult struct {
-	URL    string
-	Status int
-	Depth  int
+	URL         string
+	Status      int
+	Depth       int
+	BodyPreview []byte
+	Headers     map[string]string
+}
+
+// AsResults projects crawl results into the shared Result shape so one
+// Tier-A pipeline can consume both fuzz and crawl discoveries.
+func AsResults(crawl []CrawlResult) []Result {
+	out := make([]Result, 0, len(crawl))
+	for _, c := range crawl {
+		out = append(out, Result{
+			URL:         c.URL,
+			Status:      c.Status,
+			Depth:       c.Depth,
+			BodyPreview: c.BodyPreview,
+			Headers:     c.Headers,
+		})
+	}
+	return out
 }
 
 // Crawl walks the target's link graph breadth-first, same-origin only, up
@@ -73,7 +93,13 @@ func Crawl(ctx context.Context, eng *engine.Engine, target string, maxDepth, max
 				continue
 			}
 			if it.depth > 0 { // never report the start page as a "finding"
-				results = append(results, CrawlResult{URL: it.u.String(), Status: resp.Status, Depth: it.depth})
+				results = append(results, CrawlResult{
+					URL:         it.u.String(),
+					Status:      resp.Status,
+					Depth:       it.depth,
+					BodyPreview: previewOf(resp.Body, resp.Header.Get("Content-Type")),
+					Headers:     captureHeaders(resp.Header),
+				})
 			}
 			if it.depth >= maxDepth {
 				continue

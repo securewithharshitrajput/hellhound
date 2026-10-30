@@ -40,6 +40,27 @@ type Result struct {
 	ContentType string
 	RedirectTo  string
 	Verdict     analyze.Verdict
+	// BodyPreview holds up to resultBodyPreviewCap bytes of the body (first
+	// chunk only), text/html responses only, used by downstream Tier-A
+	// classifiers (e.g. ClassifyDirListings) that need to look at content
+	// without re-fetching. Nil for non-HTML or large/empty responses.
+	BodyPreview []byte
+	// Headers holds the small set of response headers hellhound classifies
+	// as potentially information-disclosing (Server, X-Powered-By, etc.) —
+	// not the full header map, to keep Results cheap.
+	Headers map[string]string
+}
+
+const resultBodyPreviewCap = 8 * 1024
+
+// capturedHeaders is the fixed set hellhound stores on each Result for
+// downstream info-disclosure classification. Everything outside this set
+// stays off the Result to keep per-Result memory small.
+var capturedHeaders = []string{
+	"Server", "X-Powered-By", "X-AspNet-Version", "X-AspNetMvc-Version",
+	"X-Generator", "X-Runtime", "X-Rails-Version", "X-Drupal-Cache",
+	"X-Drupal-Dynamic-Cache", "X-Application-Context", "X-Backend-Server",
+	"X-Served-By", "X-Varnish", "Via",
 }
 
 // Discoverer runs calibrated discovery over one target using a shared
@@ -191,6 +212,8 @@ func (d *Discoverer) scanDir(ctx context.Context, dir string, depth int) ([]Resu
 			ContentType: resp.Header.Get("Content-Type"),
 			RedirectTo:  resp.RedirectTo,
 			Verdict:     v,
+			BodyPreview: previewOf(resp.Body, resp.Header.Get("Content-Type")),
+			Headers:     captureHeaders(resp.Header),
 		})
 	}
 
@@ -381,6 +404,54 @@ func dedupe(ss []string) []string {
 		if !seen[s] {
 			seen[s] = true
 			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// previewOf returns up to resultBodyPreviewCap bytes of body, but ONLY for
+// text/html responses — dir-listing detection needs HTML, and binary bodies
+// (images, PDFs, octet-streams) just waste memory. Returns nil otherwise.
+func previewOf(body []byte, contentType string) []byte {
+	if len(body) == 0 {
+		return nil
+	}
+	ct := strings.ToLower(contentType)
+	if !strings.Contains(ct, "text/html") && !strings.Contains(ct, "text/plain") {
+		return nil
+	}
+	n := len(body)
+	if n > resultBodyPreviewCap {
+		n = resultBodyPreviewCap
+	}
+	cp := make([]byte, n)
+	copy(cp, body[:n])
+	return cp
+}
+
+// captureHeaders stores only the headers hellhound classifies as potentially
+// information-disclosing — a per-Result full-header map would waste memory
+// at scan scale (thousands of Results).
+func captureHeaders(h map[string][]string) map[string]string {
+	if len(h) == 0 {
+		return nil
+	}
+	var out map[string]string
+	for _, name := range capturedHeaders {
+		// http.Header is case-insensitive via its API; our storage is a flat
+		// map[string][]string, so match case-insensitively ourselves.
+		for storedName, vs := range h {
+			if !strings.EqualFold(storedName, name) {
+				continue
+			}
+			if len(vs) == 0 || vs[0] == "" {
+				continue
+			}
+			if out == nil {
+				out = map[string]string{}
+			}
+			out[name] = vs[0]
+			break
 		}
 	}
 	return out

@@ -33,9 +33,10 @@ type JSONCluster struct {
 
 // JSONReport is the full output document.
 type JSONReport struct {
-	Target   string        `json:"target"`
-	Total    int           `json:"total_findings"`
-	Clusters []JSONCluster `json:"clusters"`
+	Target           string                     `json:"target"`
+	Total            int                        `json:"total_findings"`
+	Clusters         []JSONCluster              `json:"clusters"`
+	SecurityFindings []discover.SecurityFinding `json:"security_findings,omitempty"`
 }
 
 func toJSONFinding(r discover.Result) JSONFinding {
@@ -104,4 +105,57 @@ func WriteSummary(w io.Writer, r JSONReport) {
 		}
 		fmt.Fprintf(w, "  [%d] %-60s len=%-6d %s%s\n", c.Representative.Status, c.Representative.URL, c.Representative.Length, c.Representative.Reason, tag)
 	}
+	WriteSecuritySummary(w, r.SecurityFindings)
+}
+
+// WriteSecuritySummary prints the Tier-A findings grouped by type, sorted
+// so high-severity shows up at the top. The eye-catching marker makes these
+// trivially distinguishable from the plain discovery hits above.
+func WriteSecuritySummary(w io.Writer, findings []discover.SecurityFinding) {
+	if len(findings) == 0 {
+		return
+	}
+	// highest severity first, then group by type for readability
+	sorted := make([]discover.SecurityFinding, len(findings))
+	copy(sorted, findings)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		ri := discover.SeverityRank(sorted[i].Severity)
+		rj := discover.SeverityRank(sorted[j].Severity)
+		if ri != rj {
+			return ri > rj
+		}
+		if sorted[i].Type != sorted[j].Type {
+			return sorted[i].Type < sorted[j].Type
+		}
+		return sorted[i].URL < sorted[j].URL
+	})
+
+	fmt.Fprintf(w, "\n[security] %d finding(s):\n", len(sorted))
+	for _, f := range sorted {
+		fmt.Fprintf(w, "  [%s] %s  %s\n", severityLabel(f.Severity), f.Type, f.URL)
+		fmt.Fprintf(w, "        %s\n", f.Description)
+		if f.Evidence != "" {
+			ev := f.Evidence
+			if len(ev) > 100 {
+				ev = ev[:97] + "..."
+			}
+			fmt.Fprintf(w, "        evidence: %s\n", ev)
+		}
+	}
+}
+
+// severityLabel returns an uppercased, fixed-width severity label for
+// consistent terminal alignment ("HIGH  " vs "LOW   " etc).
+func severityLabel(s string) string {
+	switch s {
+	case "high":
+		return "HIGH  "
+	case "medium":
+		return "MEDIUM"
+	case "low":
+		return "LOW   "
+	case "info":
+		return "INFO  "
+	}
+	return s
 }

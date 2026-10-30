@@ -144,18 +144,45 @@ func TestWriteCSV(t *testing.T) {
 	if len(rows) != 1+3 {
 		t.Fatalf("expected header + 3 finding rows, got %d rows: %v", len(rows), rows)
 	}
-	if rows[0][0] != "url" || rows[0][1] != "status" {
+	if rows[0][0] != "kind" || rows[0][3] != "url" {
 		t.Errorf("unexpected header: %v", rows[0])
 	}
-	// Every data row's URL must be one of the inputs.
+	// Every data row's URL must be one of the inputs (URL is column index 3
+	// now; column 0 is "kind" — "endpoint" for discovery, "security" for Tier-A).
 	seen := map[string]bool{}
 	for _, row := range rows[1:] {
-		seen[row[0]] = true
+		seen[row[3]] = true
 	}
 	for _, want := range []string{"http://t/a", "http://t/b", "http://t/admin"} {
 		if !seen[want] {
 			t.Errorf("CSV missing finding %s", want)
 		}
+	}
+}
+
+// TestWriteCSVIncludesSecurityFindings proves Tier-A security findings also
+// land in the CSV with their severity and type populated — the operator can
+// grep/pivot on the "security" rows without re-parsing JSON.
+func TestWriteCSVIncludesSecurityFindings(t *testing.T) {
+	rep := JSONReport{
+		Target: "http://target",
+		SecurityFindings: []discover.SecurityFinding{
+			{Type: "sensitive-file", Severity: "high", URL: "http://t/.env", Description: "env file"},
+		},
+	}
+	var buf bytes.Buffer
+	if err := WriteCSV(&buf, rep); err != nil {
+		t.Fatalf("WriteCSV: %v", err)
+	}
+	rows, err := csv.NewReader(&buf).ReadAll()
+	if err != nil {
+		t.Fatalf("not valid CSV: %v", err)
+	}
+	if len(rows) != 2 { // header + 1 security row
+		t.Fatalf("expected header + 1 security row, got %d: %v", len(rows), rows)
+	}
+	if rows[1][0] != "security" || rows[1][1] != "sensitive-file" || rows[1][2] != "high" {
+		t.Errorf("security row shape wrong: %v", rows[1])
 	}
 }
 

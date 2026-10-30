@@ -21,10 +21,10 @@ import (
 
 // Version is the tool's displayed version. Bump this on meaningful
 // feature changes.
-const Version = "0.5.0"
+const Version = "0.6.0"
 
 // Tagline appears under the logo and in the no-TTY fallback line.
-const Tagline = "calibrated recon beyond ffuf & katana"
+const Tagline = "calibrated recon that classifies what it finds"
 
 // Name is the word rendered as block-letter ASCII art. Change this (and
 // add any new letters to glyphs below) to re-skin the banner for a
@@ -46,6 +46,9 @@ var tips = []string{
 	"tip: -x http://127.0.0.1:8080 routes everything through Burp/ZAP (add -k for HTTPS)",
 	"tip: -rate N caps requests/sec to stay under a target's WAF/bot thresholds",
 	"tip: -crawl follows real links to find pages no wordlist could ever guess",
+	"tip: Tier-A security checks are on by default — read the [security] block first, it's the dangerous stuff",
+	"tip: tech detection auto-adds WP/Rails/Spring/Laravel/Django-specific wordlists on hits — no setup",
+	"tip: -no-security skips sensitive-file / dir-listing / OPTIONS / open-redirect probing (pure discovery mode)",
 }
 
 // glyphs maps each supported letter to a 5-row block-letter cell. Rows
