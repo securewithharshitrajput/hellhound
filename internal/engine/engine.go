@@ -134,7 +134,14 @@ type Config struct {
 	// scan under a target's rate-based bot-mitigation / WAF thresholds
 	// instead of tripping them, and what makes "slow and quiet" possible.
 	RatePerSec int
+	// Allow, if set, is consulted before every request; a URL it rejects
+	// is never sent and comes back as ErrOutOfScope. This is where scope
+	// rules are enforced, so every phase is covered by construction.
+	Allow func(rawURL string) bool
 }
+
+// ErrOutOfScope is the error of a request the scope guard refused to send.
+var ErrOutOfScope = errors.New("out of scope: request not sent")
 
 // DefaultConfig returns sane defaults for authorized scanning.
 func DefaultConfig() Config {
@@ -143,7 +150,7 @@ func DefaultConfig() Config {
 		Timeout:            10 * time.Second,
 		FollowRedirect:     false,
 		MaxBodyBytes:       512 * 1024,
-		UserAgent:          "hellhound/0.7 (+authorized-testing)",
+		UserAgent:          "hellhound/0.8 (+authorized-testing)",
 		RetryOn429:         true,
 		InsecureSkipVerify: false,
 	}
@@ -163,6 +170,8 @@ type Engine struct {
 
 	Sent     atomic.Int64
 	Backoffs atomic.Int64
+	// Blocked counts requests refused by cfg.Allow.
+	Blocked atomic.Int64
 }
 
 // New builds an Engine with a tuned transport (connection reuse, HTTP/2).
@@ -348,6 +357,10 @@ func (e *Engine) triggerBackoff(d time.Duration) {
 }
 
 func (e *Engine) do(ctx context.Context, r Request) Response {
+	if e.cfg.Allow != nil && !e.cfg.Allow(r.URL) {
+		e.Blocked.Add(1)
+		return Response{Req: r, Err: ErrOutOfScope}
+	}
 	resp := e.once(ctx, r)
 	// A connection that was reset or closed mid-exchange is a transport
 	// hiccup, not an answer about the path. Retry it once so one dropped

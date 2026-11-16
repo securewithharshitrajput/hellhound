@@ -27,6 +27,42 @@ type Options struct {
 	// result already found — a single transient failure shouldn't cost you
 	// everything found before it.
 	OnWarning func(dir string, err error)
+
+	// Manual overrides, applied on top of calibration (ffuf's -mc/-fc/-fs).
+	// MatchCodes: every response with one of these statuses is reported even
+	// when calibration judged it to be the not-found page. FilterCodes and
+	// FilterSizes: responses with these statuses / exact body sizes are
+	// never reported. A filter always wins over a match.
+	MatchCodes  map[int]bool
+	FilterCodes map[int]bool
+	FilterSizes map[int]bool
+
+	// OnProgress, if set, is called after every classified response with
+	// the directory being scanned, how many of its candidates are done, how
+	// many it has in total, and the hits so far in that directory. It is
+	// called from a single goroutine and must be fast.
+	OnProgress func(dir string, done, total, hits int)
+
+	// OnCheckpoint, if set, is called each time a directory has been
+	// scanned completely, with everything needed to continue the scan
+	// later (see Resume).
+	OnCheckpoint func(Checkpoint)
+	// Resume, if set, continues a previous scan from its checkpoint instead
+	// of starting at the base directory.
+	Resume *Checkpoint
+}
+
+// Checkpoint is the resumable state of a discovery run, captured between
+// directories: what is finished, what was found there, and what is still
+// queued. A directory that was interrupted part-way is not in it and is
+// scanned again from its start on resume.
+type Checkpoint struct {
+	Pending         []string       `json:"pending"`          // directories still to scan, in order
+	Depths          map[string]int `json:"depths"`           // every directory seen so far -> its depth
+	Results         []Result       `json:"results"`          // findings from completed directories
+	DirsDone        int            `json:"dirs_done"`        // completed directory count
+	CaseTested      bool           `json:"case_tested"`      // case-sensitivity already probed
+	CaseInsensitive bool           `json:"case_insensitive"` // and its outcome
 }
 
 // Result is one classified discovery result, ready for reporting.
@@ -52,6 +88,9 @@ type Result struct {
 	// path is the candidate path exactly as classified (before URL
 	// encoding), kept so a finding can be re-requested and re-classified.
 	path string
+	// forced marks a result reported only because of a MatchCodes override;
+	// the hit-rate safety nets neither count nor remove it.
+	forced bool
 }
 
 const resultBodyPreviewCap = 8 * 1024
@@ -118,30 +157,45 @@ func (d *Discoverer) Run(ctx context.Context, baseDir string) ([]Result, error) 
 	var all []Result
 	queue := []string{normalizeDir(baseDir)}
 	depthOf := map[string]int{normalizeDir(baseDir): 0}
+	dirsDone := 0
+	if cp := d.opts.Resume; cp != nil {
+		queue = append([]string(nil), cp.Pending...)
+		depthOf = make(map[string]int, len(cp.Depths))
+		for k, v := range cp.Depths {
+			depthOf[k] = v
+		}
+		all = append(all, cp.Results...)
+		dirsDone = cp.DirsDone
+		d.caseTested, d.caseInsensitive = cp.CaseTested, cp.CaseInsensitive
+	}
 
 	for len(queue) > 0 {
 		dir := queue[0]
-		queue = queue[1:]
 		depth := depthOf[dir]
 
 		results, err := d.scanDir(ctx, dir, depth)
+		if ctx.Err() != nil {
+			// Interrupted part-way through this directory: show what it
+			// found, but leave it queued (no checkpoint) so a resumed scan
+			// covers it completely.
+			all = append(all, results...)
+			break
+		}
+		queue = queue[1:]
 		d.detectCaseInsensitivity(ctx, results)
 		if d.caseInsensitive {
 			results = foldCase(all, results)
 		}
 		all = append(all, results...) // keep whatever we got even if err != nil below
 		if err != nil {
-			d.opts.OnWarning(dir, err)
-			continue // one bad directory doesn't abort the whole scan
-		}
-		if ctx.Err() != nil {
-			break // caller cancelled; stop queueing new work
+			d.opts.OnWarning(dir, err) // one bad directory doesn't abort the whole scan
 		}
 
-		if depth >= d.opts.MaxDepth {
-			continue
+		var recurse []string
+		if depth < d.opts.MaxDepth {
+			recurse = prioritizeRecursion(results)
 		}
-		for _, next := range prioritizeRecursion(results) {
+		for _, next := range recurse {
 			// Result URLs include the target's own base path; directories
 			// are relative to it, or "-u http://host/app" would recurse
 			// into /app/app/...
@@ -158,8 +212,52 @@ func (d *Discoverer) Run(ctx context.Context, baseDir string) ([]Result, error) 
 				queue = append(queue, next)
 			}
 		}
+		dirsDone++
+		d.checkpoint(queue, depthOf, all, dirsDone)
 	}
 	return all, nil
+}
+
+// checkpoint hands the current resumable state to OnCheckpoint.
+func (d *Discoverer) checkpoint(queue []string, depthOf map[string]int, all []Result, dirsDone int) {
+	if d.opts.OnCheckpoint == nil {
+		return
+	}
+	depths := make(map[string]int, len(depthOf))
+	for k, v := range depthOf {
+		depths[k] = v
+	}
+	d.opts.OnCheckpoint(Checkpoint{
+		Pending:         append([]string(nil), queue...),
+		Depths:          depths,
+		Results:         append([]Result(nil), all...),
+		DirsDone:        dirsDone,
+		CaseTested:      d.caseTested,
+		CaseInsensitive: d.caseInsensitive,
+	})
+}
+
+// judge classifies one response: calibration first, then the operator's
+// manual overrides. forced reports whether the response is kept only
+// because of a MatchCodes override.
+func (d *Discoverer) judge(dir, path string, resp engine.Response) (v analyze.Verdict, forced bool) {
+	v = d.cal.Classify(dir, path, resp)
+	if resp.Err != nil {
+		return v, false
+	}
+	if d.opts.FilterCodes[resp.Status] {
+		v.Interesting, v.Reason = false, fmt.Sprintf("status %d hidden by -fc", resp.Status)
+		return v, false
+	}
+	if d.opts.FilterSizes[resp.Length] {
+		v.Interesting, v.Reason = false, fmt.Sprintf("size %d hidden by -fs", resp.Length)
+		return v, false
+	}
+	if !v.Interesting && d.opts.MatchCodes[resp.Status] {
+		v.Interesting, v.Reason = true, fmt.Sprintf("status %d shown because of -mc (calibration: %s)", resp.Status, v.Reason)
+		return v, true
+	}
+	return v, false
 }
 
 // scanDir calibrates one directory, fuzzes it with the wordlist (x
@@ -257,7 +355,14 @@ func (d *Discoverer) scanDir(ctx context.Context, dir string, depth int) ([]Resu
 			rateLimited++
 		}
 		path, _ := resp.Req.Meta.(string)
-		v := d.cal.Classify(dir, path, resp)
+		v, forced := d.judge(dir, path, resp)
+		if d.opts.OnProgress != nil {
+			hits := len(results)
+			if v.Interesting {
+				hits++
+			}
+			d.opts.OnProgress(dir, total, len(candidates), hits)
+		}
 		if !v.Interesting {
 			continue
 		}
@@ -274,6 +379,7 @@ func (d *Discoverer) scanDir(ctx context.Context, dir string, depth int) ([]Resu
 			BodyPreview: previewOf(resp.Body, resp.Header.Get("Content-Type")),
 			Headers:     captureHeaders(resp.Header),
 			path:        path,
+			forced:      forced,
 		})
 	}
 
@@ -318,6 +424,30 @@ const (
 // handful of fresh probes — it will not re-hammer an already-struggling
 // target.
 func (d *Discoverer) recalibrateIfDrifted(ctx context.Context, dir string, results []Result, total int) []Result {
+	// Results kept only because of -mc are the operator's explicit choice:
+	// set them aside so they neither trip nor get removed by the checks
+	// below, and add them back at the end.
+	var forcedResults []Result
+	if len(d.opts.MatchCodes) > 0 {
+		organic := results[:0:0]
+		for _, r := range results {
+			if r.forced {
+				forcedResults = append(forcedResults, r)
+			} else {
+				organic = append(organic, r)
+			}
+		}
+		results = organic
+	}
+	if len(forcedResults) > 0 {
+		return append(d.driftCheck(ctx, dir, results, total), forcedResults...)
+	}
+	return d.driftCheck(ctx, dir, results, total)
+}
+
+// driftCheck is the body of recalibrateIfDrifted, run on calibrated
+// (non-forced) results only.
+func (d *Discoverer) driftCheck(ctx context.Context, dir string, results []Result, total int) []Result {
 	if len(results) == 0 || total == 0 || float64(len(results))/float64(total) <= driftHitRate {
 		return results
 	}
@@ -416,7 +546,7 @@ func (d *Discoverer) reverify(ctx context.Context, dir string, results []Result,
 		if p == "" {
 			p = strings.TrimPrefix(urlPath(res.URL), d.basePath)
 		}
-		if v := d.cal.Classify(dir, p, resp); v.Interesting {
+		if v, _ := d.judge(dir, p, resp); v.Interesting {
 			res.Verdict = v
 			kept = append(kept, res)
 		}

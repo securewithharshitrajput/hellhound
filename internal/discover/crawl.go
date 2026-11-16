@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/securewithharshitrajput/hellhound/internal/engine"
 )
@@ -57,6 +58,24 @@ func AsResults(crawl []CrawlResult) []Result {
 // forever). It returns every linked page it reached, excluding the start
 // page itself.
 func Crawl(ctx context.Context, eng *engine.Engine, target string, maxDepth, maxPages int) []CrawlResult {
+	return CrawlWith(ctx, eng, target, maxDepth, maxPages, nil)
+}
+
+// Renderer returns the DOM of a page after its scripts have run.
+type Renderer func(ctx context.Context, pageURL string) ([]byte, error)
+
+// maxRenderParallel bounds how many browser instances run at once; each
+// is a full browser process.
+const maxRenderParallel = 3
+
+// CrawlWith is Crawl with an optional Renderer. When render is non-nil,
+// every HTML page that is fetched is also rendered, and links that only
+// exist after its JavaScript has run are followed too — what makes
+// single-page apps crawlable. The engine still fetches every page itself,
+// so statuses, headers, scope rules and rate limits apply as usual; the
+// renderer only contributes links. onRenderError, if non-nil, receives
+// render failures (they never stop the crawl).
+func CrawlWith(ctx context.Context, eng *engine.Engine, target string, maxDepth, maxPages int, render Renderer, onRenderError ...func(pageURL string, err error)) []CrawlResult {
 	base, err := url.Parse(target)
 	if err != nil || base.Host == "" {
 		return nil
@@ -86,6 +105,34 @@ func Crawl(ctx context.Context, eng *engine.Engine, target string, maxDepth, max
 			reqs[i] = engine.Request{Method: "GET", URL: it.u.String()}
 		}
 		resps := eng.DoAll(ctx, reqs)
+
+		// Render the pages worth parsing (2xx HTML, not at the depth limit),
+		// a few at a time.
+		rendered := make([][]byte, len(resps))
+		if render != nil {
+			sem := make(chan struct{}, maxRenderParallel)
+			var wg sync.WaitGroup
+			for i, resp := range resps {
+				if ctx.Err() != nil || frontier[i].depth >= maxDepth || !isParsableHTML(resp) {
+					continue
+				}
+				wg.Add(1)
+				sem <- struct{}{}
+				go func(i int, pageURL string) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					dom, err := render(ctx, pageURL)
+					if err != nil {
+						if len(onRenderError) > 0 && onRenderError[0] != nil && ctx.Err() == nil {
+							onRenderError[0](pageURL, err)
+						}
+						return
+					}
+					rendered[i] = dom
+				}(i, frontier[i].u.String())
+			}
+			wg.Wait()
+		}
 
 		var next []item
 		for i, resp := range resps {
@@ -119,7 +166,7 @@ func Crawl(ctx context.Context, eng *engine.Engine, target string, maxDepth, max
 			if ct := strings.ToLower(resp.Header.Get("Content-Type")); ct != "" && !strings.Contains(ct, "html") {
 				continue
 			}
-			for _, raw := range extractLinks(resp.Body) {
+			for _, raw := range append(extractLinks(resp.Body), extractLinks(rendered[i])...) {
 				abs := resolveInScope(it.u, raw, base.Host)
 				if abs == nil {
 					continue
@@ -243,4 +290,14 @@ func WordsFromCrawl(results []CrawlResult) []string {
 		}
 	}
 	return out
+}
+
+// isParsableHTML reports whether resp is a successful HTML page — the only
+// kind worth parsing (or rendering) for links.
+func isParsableHTML(resp engine.Response) bool {
+	if resp.Err != nil || resp.Status < 200 || resp.Status >= 300 {
+		return false
+	}
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	return ct == "" || strings.Contains(ct, "html")
 }

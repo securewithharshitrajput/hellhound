@@ -12,8 +12,13 @@ import (
 	"regexp"
 	"strings"
 
+	"bytes"
+	"compress/gzip"
 	"github.com/securewithharshitrajput/hellhound/internal/engine"
 	"github.com/securewithharshitrajput/hellhound/internal/wordlist"
+	"html"
+	"io"
+	"net/url"
 )
 
 var scriptSrcRe = regexp.MustCompile(`<script[^>]+src=["']([^"']+)["']`)
@@ -43,8 +48,23 @@ func BuildWordlist(ctx context.Context, eng *engine.Engine, baseURL string, seed
 	first := eng.DoAll(ctx, []engine.Request{
 		{Method: "GET", URL: baseURL + "/robots.txt"},
 		{Method: "GET", URL: baseURL + "/"},
+		{Method: "GET", URL: baseURL + "/sitemap.xml"},
 	})
-	robots, home := first[0], first[1]
+	robots, home, sitemap := first[0], first[1], first[2]
+
+	// The sitemap is the target's own list of its pages: every path in it
+	// is a real one, and its segments are exactly the vocabulary this site
+	// uses. robots.txt may point at further sitemaps.
+	var robotsBody []byte
+	if robots.Err == nil && robots.Status == 200 {
+		robotsBody = robots.Body
+	}
+	for _, p := range sitemapPaths(ctx, eng, baseURL, sitemap, robotsBody) {
+		if w := strings.Trim(p, "/"); w != "" && len(w) <= 200 {
+			mined = append(mined, w)
+		}
+		mined = append(mined, wordlist.PathToWords([]string{p})...)
+	}
 
 	if robots.Err == nil && robots.Status == 200 {
 		paths := wordlist.FromRobots(robots.Body)
@@ -118,4 +138,95 @@ func resolveScriptURL(baseURL, src string) string {
 	default:
 		return ""
 	}
+}
+
+const (
+	maxSitemapFiles = 6       // sitemap documents fetched per run (index children included)
+	maxSitemapPaths = 5000    // paths taken from sitemaps in total
+	maxSitemapBytes = 4 << 20 // decompressed size cap per sitemap
+)
+
+var (
+	sitemapLocRe    = regexp.MustCompile(`(?is)<loc>\s*(?:<!\[CDATA\[)?\s*([^<\]\s]+)`)
+	robotsSitemapRe = regexp.MustCompile(`(?im)^\s*sitemap\s*:\s*(\S+)`)
+)
+
+// sitemapPaths returns the same-host paths listed in the target's sitemaps:
+// /sitemap.xml (already fetched as first), any "Sitemap:" lines in
+// robots.txt, and one level of sitemap-index children. Everything is
+// bounded: files, paths and bytes.
+func sitemapPaths(ctx context.Context, eng *engine.Engine, baseURL string, first engine.Response, robotsBody []byte) []string {
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return nil
+	}
+	seenFile := map[string]bool{baseURL + "/sitemap.xml": true}
+	var queue []string
+	enqueue := func(raw string) {
+		u, err := base.Parse(strings.TrimSpace(html.UnescapeString(raw)))
+		if err != nil || u.Host != base.Host || (u.Scheme != "http" && u.Scheme != "https") {
+			return
+		}
+		if s := u.String(); !seenFile[s] {
+			seenFile[s] = true
+			queue = append(queue, s)
+		}
+	}
+	for _, m := range robotsSitemapRe.FindAllSubmatch(robotsBody, 20) {
+		enqueue(string(m[1]))
+	}
+
+	seenPath := map[string]bool{}
+	var paths []string
+	fetched := 0
+	process := func(resp engine.Response) {
+		fetched++
+		if resp.Err != nil || resp.Status != 200 {
+			return
+		}
+		body := gunzipIfNeeded(resp.Body)
+		isIndex := bytes.Contains(bytes.ToLower(body[:min(len(body), 2048)]), []byte("<sitemapindex"))
+		for _, m := range sitemapLocRe.FindAllSubmatch(body, maxSitemapPaths) {
+			loc := html.UnescapeString(string(m[1]))
+			if isIndex {
+				enqueue(loc)
+				continue
+			}
+			u, err := base.Parse(loc)
+			if err != nil || u.Host != base.Host || u.Path == "" || u.Path == "/" {
+				continue
+			}
+			if !seenPath[u.Path] && len(paths) < maxSitemapPaths {
+				seenPath[u.Path] = true
+				paths = append(paths, u.Path)
+			}
+		}
+	}
+	process(first)
+	for len(queue) > 0 && fetched < maxSitemapFiles && ctx.Err() == nil {
+		n := min(len(queue), maxSitemapFiles-fetched)
+		reqs := make([]engine.Request, n)
+		for i := range reqs {
+			reqs[i] = engine.Request{Method: "GET", URL: queue[i]}
+		}
+		queue = queue[n:]
+		for _, r := range eng.DoAll(ctx, reqs) {
+			process(r)
+		}
+	}
+	return paths
+}
+
+// gunzipIfNeeded decompresses a .xml.gz sitemap body, up to maxSitemapBytes.
+func gunzipIfNeeded(body []byte) []byte {
+	if len(body) < 2 || body[0] != 0x1f || body[1] != 0x8b {
+		return body
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		return nil
+	}
+	defer zr.Close()
+	out, _ := io.ReadAll(io.LimitReader(zr, maxSitemapBytes))
+	return out
 }

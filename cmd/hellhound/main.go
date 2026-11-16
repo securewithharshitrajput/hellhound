@@ -24,7 +24,9 @@ import (
 	"github.com/securewithharshitrajput/hellhound/internal/banner"
 	"github.com/securewithharshitrajput/hellhound/internal/discover"
 	"github.com/securewithharshitrajput/hellhound/internal/engine"
+	"github.com/securewithharshitrajput/hellhound/internal/render"
 	"github.com/securewithharshitrajput/hellhound/internal/report"
+	"github.com/securewithharshitrajput/hellhound/internal/scope"
 	"github.com/securewithharshitrajput/hellhound/internal/wordlist"
 )
 
@@ -77,10 +79,30 @@ func main() {
 		noBanner     = flag.Bool("no-banner", false, "suppress the startup banner")
 		noSecurity   = flag.Bool("no-security", false, "skip Tier-A security checks (sensitive files, dir listing, dangerous HTTP methods, open-redirect, info-disclosure headers)")
 		noTechMine   = flag.Bool("no-tech", false, "skip tech-stack fingerprinting + tech-specific wordlist injection (WordPress/Django/Rails/Laravel/Spring/etc.)")
+		matchCodes   = flag.String("mc", "", "always report these status codes, even when calibration judged them to be the not-found page (e.g. 401,403 or 500-599)")
+		filterCodes  = flag.String("fc", "", "never report these status codes (e.g. 404,418 or 300-399); wins over -mc")
+		filterSizes  = flag.String("fs", "", "never report responses whose body is exactly this many bytes (e.g. 0,1234)")
+		scopeFile    = flag.String("scope", "", "scope file: hosts/paths the scan may touch and '!' exclusions; enforced on every request (see README)")
+		resumeFile   = flag.String("resume", "", "state file: saved after every completed directory; if it already exists the scan continues from it instead of starting over")
+		noProgress   = flag.Bool("no-progress", false, "do not draw the live progress line (it is only drawn on a terminal anyway)")
+		renderJS     = flag.Bool("render", false, "with -crawl: also render each page in a local headless Chrome/Chromium and follow links that only exist after its JavaScript ran (single-page apps)")
+		renderBin    = flag.String("render-browser", "", "path or name of the Chrome/Chromium binary for -render (default: auto-detect)")
+		showVersion  = flag.Bool("version", false, "print the version and exit")
 	)
+	flag.String("config", "", "config file with one \"name = value\" per line (any flag); the command line overrides it")
+	flag.String("profile", "", "preset of defaults: quick, deep or gentle; a config file and the command line override it")
 	flag.Var(headers, "H", `custom header, repeatable, format "Name: value" (e.g. -H "Authorization: Bearer xyz")`)
-	flag.Parse()
+	args, argErr := expandArgs(flag.CommandLine, os.Args[1:])
+	if argErr != nil {
+		fmt.Fprintf(os.Stderr, "hellhound: %v\n", argErr)
+		os.Exit(2)
+	}
+	flag.CommandLine.Parse(args)
 
+	if *showVersion {
+		fmt.Printf("hellhound %s\n", banner.Version)
+		return
+	}
 	banner.Print(*noBanner)
 
 	if *target == "" {
@@ -107,6 +129,34 @@ func main() {
 	if err == nil {
 		err = checkWritable(*jsonOut, *csvOut, *sarifOut)
 	}
+	var mcSet, fcSet, fsSet map[int]bool
+	if err == nil {
+		mcSet, err = parseIntSet("-mc", *matchCodes, 100, 599)
+	}
+	if err == nil {
+		fcSet, err = parseIntSet("-fc", *filterCodes, 100, 599)
+	}
+	if err == nil {
+		fsSet, err = parseIntSet("-fs", *filterSizes, 0, 1<<31-1)
+	}
+	var sc *scope.Scope
+	if err == nil && *scopeFile != "" {
+		sc, err = loadScope(*scopeFile, baseURL)
+	}
+	var state *scanState
+	if err == nil && *resumeFile != "" {
+		if state, err = loadState(*resumeFile, baseURL); err == nil && state == nil {
+			err = checkWritable(*resumeFile)
+		}
+	}
+	var renderer discover.Renderer
+	if err == nil && *renderJS {
+		if !*crawl {
+			*crawl = true
+			fmt.Fprintln(os.Stderr, "hellhound: -render implies -crawl; crawling enabled")
+		}
+		renderer, err = newRenderer(*renderBin, *proxyURL, *insecure, *timeout, len(headers) > 0)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "hellhound: %v\n", err)
 		os.Exit(2)
@@ -120,6 +170,13 @@ func main() {
 	cfg.MaxBodyBytes = int64(*maxBodyKB) * 1024
 	cfg.ProxyURL = *proxyURL
 	cfg.RatePerSec = *rate
+	// Every request passes this guard. Even without a scope file the scan
+	// is confined to the target's own host and port: nothing a page links
+	// to, redirects to or lists in a sitemap can pull requests elsewhere.
+	targetHost := hostOf(baseURL)
+	cfg.Allow = func(rawURL string) bool {
+		return hostOf(rawURL) == targetHost && sc.Allows(rawURL)
+	}
 	eng, err := engine.NewErr(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "hellhound: %v\n", err)
@@ -162,8 +219,17 @@ func main() {
 
 	seed := wordlist.Merge(wordlist.Seed, userWords)
 	words := seed
+	if state != nil {
+		// Continuing a saved scan: use exactly the inputs it started with,
+		// so the remaining directories are tested with the same candidates,
+		// and do not repeat the preparation phases.
+		words, *depth, *calibN = state.Words, state.MaxDepth, state.CalibN
+		*noMine, *noTechMine, *crawl = true, true, false
+		fmt.Fprintf(os.Stderr, "hellhound: resuming from %s — %d director(ies) already done, %d queued, %d finding(s) so far (wordlist, -ext, -depth and -calibrate are taken from the saved scan)\n",
+			*resumeFile, state.Checkpoint.DirsDone, len(state.Checkpoint.Pending), len(state.Checkpoint.Results))
+	}
 	if !*noMine {
-		fmt.Fprintf(os.Stderr, "hellhound: mining robots.txt + homepage + linked JS for target-derived words...\n")
+		fmt.Fprintf(os.Stderr, "hellhound: mining robots.txt + sitemap.xml + homepage + linked JS for target-derived words...\n")
 		words = discover.BuildWordlist(ctx, eng, baseURL, seed)
 		if extra := len(words) - len(seed); extra > 0 {
 			fmt.Fprintf(os.Stderr, "hellhound: mined %d additional word(s) from the target itself\n", extra)
@@ -199,8 +265,11 @@ func main() {
 	// because a crawl-found page's segments are now fuzzed, those pages also
 	// land in the structured report/output files, not just the [crawl] text.
 	var crawlResults []discover.CrawlResult
+	if state != nil {
+		crawlResults = state.Crawl
+	}
 	if ctx.Err() == nil && *crawl {
-		crawlResults = runCrawl(ctx, eng, baseURL, *crawlDepth, *crawlMax)
+		crawlResults = runCrawl(ctx, eng, baseURL, *crawlDepth, *crawlMax, renderer)
 		if cw := discover.WordsFromCrawl(crawlResults); len(cw) > 0 {
 			before := len(words)
 			words = wordlist.Merge(words, cw)
@@ -224,31 +293,65 @@ func main() {
 			exts = append(exts, e)
 		}
 	}
+	if state != nil {
+		exts = state.Extensions
+	}
 
-	d := discover.New(eng, discover.Options{
+	prog := newProgress(os.Stderr, !*noProgress, eng.Sent.Load)
+	opts := discover.Options{
 		BaseURL:      baseURL,
 		Wordlist:     words,
 		CalibrationN: *calibN,
 		MaxDepth:     *depth,
 		Extensions:   exts,
+		MatchCodes:   mcSet,
+		FilterCodes:  fcSet,
+		FilterSizes:  fsSet,
+		OnProgress:   prog.Update,
 		OnWarning: func(dir string, err error) {
-			fmt.Fprintf(os.Stderr, "hellhound: warning: scanning %s: %s (continuing)\n", report.Clean(dir), report.Clean(err.Error()))
+			prog.Println("hellhound: warning: scanning %s: %s (continuing)", report.Clean(dir), report.Clean(err.Error()))
 		},
-	})
+	}
+	stateFailed := false
+	opts.OnCheckpoint = func(cp discover.Checkpoint) {
+		prog.DirDone(len(cp.Results))
+		if *resumeFile == "" || stateFailed {
+			return
+		}
+		st := &scanState{Target: baseURL, Words: words, Extensions: exts, MaxDepth: *depth, CalibN: *calibN, Crawl: crawlResults, Checkpoint: cp}
+		if err := saveState(*resumeFile, st); err != nil {
+			stateFailed = true
+			prog.Println("hellhound: warning: could not save resume state to %s: %v (the scan continues, but cannot be resumed)", *resumeFile, err)
+		}
+	}
+	if state != nil {
+		opts.Resume = &state.Checkpoint
+	}
+	d := discover.New(eng, opts)
 
 	fmt.Fprintf(os.Stderr, "hellhound: calibrating + scanning %s with %d words x %d extensions (depth=%d, concurrency=%d)\n",
 		*target, len(words), len(exts), *depth, *concurrency)
 
 	start := time.Now()
 	results, err := d.Run(ctx, "/")
+	prog.Clear()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "hellhound: error: %v\n", err)
 		os.Exit(1)
 	}
 	if ctx.Err() != nil {
-		fmt.Fprintf(os.Stderr, "hellhound: interrupted after %s, sent %d requests — showing partial results below\n\n",
+		fmt.Fprintf(os.Stderr, "hellhound: interrupted after %s, sent %d requests — showing partial results below\n",
 			time.Since(start).Round(time.Millisecond), eng.Sent.Load())
+		if *resumeFile != "" && !stateFailed {
+			fmt.Fprintf(os.Stderr, "hellhound: progress is saved in %s — run the same command again to continue from the last completed directory\n", *resumeFile)
+		} else if *resumeFile == "" {
+			fmt.Fprintln(os.Stderr, "hellhound: tip: add -resume <file> to be able to continue an interrupted scan")
+		}
+		fmt.Fprintln(os.Stderr)
 	} else {
+		if *resumeFile != "" {
+			os.Remove(*resumeFile) // finished: nothing left to resume
+		}
 		fmt.Fprintf(os.Stderr, "hellhound: done in %s, sent %d requests (%d backoff pauses)\n\n",
 			time.Since(start).Round(time.Millisecond), eng.Sent.Load(), eng.Backoffs.Load())
 	}
@@ -283,6 +386,9 @@ func main() {
 	writeOutput("CSV", *csvOut, rep, report.WriteCSV)
 	writeOutput("SARIF", *sarifOut, rep, report.WriteSARIF)
 
+	if n := eng.Blocked.Load(); n > 0 {
+		fmt.Fprintf(os.Stderr, "hellhound: %d request(s) were not sent because they fell outside the allowed scope\n", n)
+	}
 	if ctx.Err() != nil {
 		// Partial results were printed and written, but the scan did not
 		// finish: exit like any interrupted program so scripts and CI do
@@ -583,10 +689,18 @@ func runVHostScan(ctx context.Context, eng *engine.Engine, baseURL, vhostFile st
 // runCrawl follows real links from the target to surface pages no wordlist
 // could guess — the one job a pure fuzzer structurally can't do, and the
 // gap this closes versus katana.
-func runCrawl(ctx context.Context, eng *engine.Engine, baseURL string, depth, maxPages int) []discover.CrawlResult {
+func runCrawl(ctx context.Context, eng *engine.Engine, baseURL string, depth, maxPages int, render discover.Renderer) []discover.CrawlResult {
 	start := time.Now()
 	fmt.Fprintf(os.Stderr, "\nhellhound: crawling %s for linked pages (max depth %d, max %d pages)...\n", baseURL, depth, maxPages)
-	results := discover.Crawl(ctx, eng, baseURL, depth, maxPages)
+	renderErrs := 0
+	results := discover.CrawlWith(ctx, eng, baseURL, depth, maxPages, render, func(pageURL string, err error) {
+		if renderErrs++; renderErrs <= 3 {
+			fmt.Fprintf(os.Stderr, "hellhound: warning: could not render %s: %s\n", report.Clean(pageURL), report.Clean(err.Error()))
+		}
+	})
+	if renderErrs > 3 {
+		fmt.Fprintf(os.Stderr, "hellhound: warning: %d more page(s) could not be rendered\n", renderErrs-3)
+	}
 	if len(results) == 0 {
 		fmt.Println("\n[crawl] no additional linked pages found")
 	} else {
@@ -627,4 +741,51 @@ func parseList(data []byte) []string {
 		out = append(out, line)
 	}
 	return out
+}
+
+// hostOf returns the lowercase host:port of a URL ("" if it has none).
+func hostOf(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Host)
+}
+
+// loadScope reads a scope file and checks that the target itself is in it —
+// a scope that excludes the target would otherwise "scan" by sending nothing.
+func loadScope(path, baseURL string) (*scope.Scope, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read -scope file: %v", err)
+	}
+	defer f.Close()
+	sc, err := scope.Parse(f)
+	if err != nil {
+		return nil, fmt.Errorf("-scope %s: %v", path, err)
+	}
+	if !sc.Allows(baseURL + "/") {
+		if why := sc.Blocker(baseURL + "/"); why != "" {
+			return nil, fmt.Errorf("the target %s is excluded by scope rule %q in %s", baseURL, why, path)
+		}
+		return nil, fmt.Errorf("the target %s is not covered by any rule in %s", baseURL, path)
+	}
+	return sc, nil
+}
+
+// newRenderer prepares page rendering through a local headless browser.
+func newRenderer(browser, proxy string, insecure bool, timeout time.Duration, hasHeaders bool) (discover.Renderer, error) {
+	if os.Geteuid() == 0 {
+		return nil, fmt.Errorf("-render cannot be used as root: Chrome's sandbox does not run as root, and rendering untrusted pages without it is unsafe — run hellhound as a normal user")
+	}
+	path, err := render.Find(browser)
+	if err != nil {
+		return nil, fmt.Errorf("-render: %v", err)
+	}
+	fmt.Fprintf(os.Stderr, "hellhound: rendering pages with %s (confined to the target host)\n", path)
+	if hasHeaders {
+		fmt.Fprintln(os.Stderr, "hellhound: note: the browser does not send -H headers, so pages are rendered as an anonymous visitor; the crawler's own requests still carry them")
+	}
+	c := &render.Chrome{Path: path, Timeout: timeout + 20*time.Second, Proxy: proxy, Insecure: insecure, UserAgent: "hellhound/" + banner.Version + " (+authorized-testing; headless)"}
+	return c.DOM, nil
 }

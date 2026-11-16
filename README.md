@@ -67,16 +67,18 @@ flowchart LR
 ## Install
 
 ```bash
-go install github.com/securewithharshitrajput/hellhound/cmd/hellhound@v0.7.0
+go install github.com/securewithharshitrajput/hellhound/cmd/hellhound@v0.8.0
 ```
 
-(Pin to a tagged version like `@v0.7.0` rather than `@latest` — Go's module proxy caches version lookups, and `@latest` against an untagged commit can serve a stale result until the proxy's cache naturally refreshes. A tagged release doesn't have that problem.)
+(Pin to a tagged version like `@v0.8.0` rather than `@latest` — Go's module proxy caches version lookups, and `@latest` against an untagged commit can serve a stale result until the proxy's cache naturally refreshes. A tagged release doesn't have that problem.)
 
 This drops a `hellhound` binary into `$(go env GOBIN)` (usually `~/go/bin`) — the same place `ffuf`/`katana` live. Make sure that's on your `PATH` and you're done:
 
 ```bash
 hellhound -u http://target.tld
 ```
+
+**Prebuilt binaries (no Go needed):** every tagged version has archives for Linux, macOS and Windows (amd64 and arm64) with a `SHA256SUMS` file on the [Releases page](https://github.com/securewithharshitrajput/hellhound/releases). Download, verify the checksum, unpack, and put `hellhound` on your `PATH`.
 
 **From source:**
 
@@ -193,6 +195,17 @@ The banner at the top is randomized per run (Metasploit-style rotating tips) and
 | `-json` | — | Write the full clustered JSON report (incl. security findings) to this path |
 | `-csv` | — | Write findings as CSV (one row per finding, security findings tagged `security`) to this path |
 | `-sarif` | — | Write findings as SARIF 2.1.0 to this path (for CI / GitHub code scanning) |
+| `-mc` | — | Always report these status codes, even when calibration judged them to be the not-found page: `-mc 401,403`, `-mc 500-599` |
+| `-fc` | — | Never report these status codes: `-fc 404,418`, `-fc 300-399`. Wins over `-mc` |
+| `-fs` | — | Never report responses whose body is exactly this many bytes: `-fs 0,1234` |
+| `-scope` | — | Scope file: the hosts and paths the scan may touch, with `!` exclusions. Enforced on every request (see [Scope](#scope)) |
+| `-resume` | — | State file, saved after every completed directory. If it exists, the scan continues from it (see [Resume](#resume)) |
+| `-render` | `false` | With `-crawl`: render each page in a local headless Chrome/Chromium and follow links that only exist after its JavaScript ran (see [Rendering](#rendering)) |
+| `-render-browser` | auto | Path or name of the browser binary for `-render` |
+| `-config` | — | Config file, one `name = value` per line for any flag; the command line overrides it |
+| `-profile` | — | Preset defaults: `quick`, `deep` or `gentle`; a config file and the command line override it |
+| `-no-progress` | `false` | Do not draw the live progress line (it is only drawn on a terminal) |
+| `-version` | | Print the version and exit |
 
 ### Tier-A security findings
 
@@ -229,7 +242,7 @@ This isn't "it compiled, ship it." The analyzer and engine were deliberately put
 - **50,000-word stress test** against a live server — found and fixed a ~0.1% false-positive edge case in redaction ordering
 - **Goroutine leak checks** across repeated scans
 
-153 tests and fuzz targets passing (every Tier-A detector carries fingerprint, false-positive-rejection and catch-all-target regression tests, plus fuzzing of everything that parses target-controlled bodies and headers), `go vet` and `gofmt` clean, zero known crashes.
+180 tests and fuzz targets passing (every Tier-A detector carries fingerprint, false-positive-rejection and catch-all-target regression tests, plus fuzzing of everything that parses target-controlled bodies and headers), `go vet` and `gofmt` clean, zero known crashes.
 
 ```bash
 go test ./...
@@ -238,6 +251,80 @@ go test ./internal/analyze/ -fuzz FuzzSimHash -fuzztime 30s
 ```
 
 ---
+
+## Scope
+
+`-scope file` confines the scan. The file has one rule per line; blank lines and `#` comments are ignored, and a leading `!` makes a rule an exclusion:
+
+```
+# what this engagement covers
+app.example.com
+*.dev.example.com
+api.example.com:8443
+https://shop.example.com/store/
+
+# never touch these
+!/logout
+!/admin/billing
+!*/delete*
+```
+
+| Rule form | Matches |
+|---|---|
+| `example.com` | that host, any port, any path |
+| `*.example.com` | any subdomain |
+| `example.com:8443` | that host on one port |
+| `https://example.com/app/` | scheme, host and a path prefix |
+| `/admin` | a path prefix (segment-bounded: not `/administrator`) on any allowed host |
+| `*/delete*`, `/api/*/export` | a path glob; `*` matches any run of characters |
+
+A URL is in scope when no exclusion matches and, if the file has any non-exclusion rule, one of them does. Exclusions always win. Paths are matched after percent-decoding. The check sits inside the HTTP engine, so fuzzing, crawling, security probes and API probing are all covered; requests that fall outside are not sent and are counted at the end. Hellhound refuses to start if the target itself is out of scope.
+
+Independently of any scope file, hellhound only sends requests to the target's own host and port: a link, redirect or sitemap entry cannot pull the scan elsewhere.
+
+## Resume
+
+```bash
+hellhound -u https://target.tld -w big.txt -resume scan.state
+```
+
+The state file is written (atomically) each time a directory finishes. If the scan is interrupted, run the same command again: completed directories and their findings are loaded, and the scan continues with the queued ones. Only the directory that was in progress is scanned again. The saved scan's wordlist, extensions, depth and calibration size are reused so the continuation tests the same candidates. The file is removed when the scan completes, and a state file from a different target is rejected.
+
+## Config files and profiles
+
+```
+# hh.conf
+u = https://staging.example.com
+w = /opt/lists/common.txt
+depth = 3
+crawl
+scope = scope.txt
+H = Authorization: Bearer <token>
+H = X-Engagement: ACME-2026
+```
+
+```bash
+hellhound -config hh.conf            # everything from the file
+hellhound -config hh.conf -depth 0   # the command line overrides the file
+hellhound -profile gentle -u https://prod.example.com
+```
+
+Precedence: profile < config file < command line.
+
+| Profile | Sets |
+|---|---|
+| `quick` | root directory only, 60 workers |
+| `deep` | depth 4, crawling to depth 5 (2000 pages), 8 calibration probes |
+| `gentle` | 4 workers, 8 requests/sec, depth 1, 20s timeout — for fragile or production targets |
+
+## Rendering
+
+A single-page app's HTML is an empty shell; its links exist only after its scripts run. `-crawl -render` loads each crawled page in a Chrome or Chromium **already installed on your machine** (headless) and follows the links found in the resulting DOM. Nothing is downloaded or bundled and hellhound has no Go dependency for this.
+
+- The crawler still fetches every page itself, so scope rules, rate limits, headers and status handling apply as usual; the browser only contributes links.
+- The browser is confined to the target's hostname: other hostnames are made unresolvable, so third-party scripts, trackers and fonts are not fetched.
+- It runs with its own sandbox enabled, in a throw-away profile that is deleted afterwards; hellhound refuses to render as root rather than disable the sandbox.
+- Limits: the browser does not send your `-H` headers (pages are rendered as an anonymous visitor), it does load same-host sub-resources of the pages it renders, and each page costs a browser start (about a second), up to three in parallel.
 
 ## Behaviour on difficult targets
 

@@ -21,7 +21,7 @@ import (
 
 // Version is the tool's displayed version. Bump this on meaningful
 // feature changes.
-const Version = "0.7.0"
+const Version = "0.8.0"
 
 // Tagline appears under the logo and in the no-TTY fallback line.
 const Tagline = "calibrated recon that classifies what it finds"
@@ -49,6 +49,11 @@ var tips = []string{
 	"tip: Tier-A security checks are on by default — read the [security] block first, it's the dangerous stuff",
 	"tip: tech detection auto-adds WP/Rails/Spring/Laravel/Django-specific wordlists on hits — no setup",
 	"tip: -no-security skips sensitive-file / dir-listing / OPTIONS / open-redirect probing (pure discovery mode)",
+	"tip: -resume scan.state saves progress after every directory — run the same command again to continue",
+	"tip: -scope scope.txt confines every request to the hosts and paths you are authorized to test",
+	"tip: -mc 401,403 shows statuses calibration would hide; -fc and -fs hide what you don't want",
+	"tip: -crawl -render follows links that only exist after a page's JavaScript has run",
+	"tip: -profile quick|deep|gentle, or -config file, instead of retyping the same flags",
 }
 
 // glyphs maps each supported letter to a 5-row block-letter cell. Rows
