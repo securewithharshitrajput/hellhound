@@ -155,7 +155,11 @@ func resolveInScope(page *url.URL, raw, host string) *url.URL {
 // is kept so distinct query-driven pages are each visited, bounded by
 // maxPages.
 func canonicalURL(u *url.URL) string {
-	return u.Scheme + "://" + u.Host + u.Path + "?" + u.RawQuery
+	path := u.Path
+	if path == "" {
+		path = "/" // "http://host" and "http://host/" are the same page
+	}
+	return u.Scheme + "://" + u.Host + path + "?" + u.RawQuery
 }
 
 // extractLinks returns the raw href/src/action values from an HTML body,

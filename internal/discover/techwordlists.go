@@ -44,14 +44,14 @@ type techFingerprint struct {
 }
 
 var fingerprints = []techFingerprint{
-	{TechWordPress, []string{"/wp-content/", "/wp-includes/", "wp-emoji", "WordPress"}, map[string]string{"x-powered-by": "WordPress", "link": "wp-json"}},
+	{TechWordPress, []string{"/wp-content/", "/wp-includes/", `content="WordPress`}, map[string]string{"x-powered-by": "WordPress", "link": "wp-json"}},
 	{TechDrupal, []string{"Drupal.settings", "sites/all/", "sites/default/"}, map[string]string{"x-drupal-cache": "", "x-generator": "Drupal"}},
-	{TechJoomla, []string{"/media/jui/", "Joomla!", "/components/com_"}, map[string]string{"x-generator": "Joomla"}},
+	{TechJoomla, []string{"/media/jui/", `content="Joomla!`, "/components/com_"}, map[string]string{"x-generator": "Joomla"}},
 	{TechDjango, []string{"csrfmiddlewaretoken", "__admin_media_prefix__"}, map[string]string{}},
 	{TechRails, []string{"csrf-param\" content=\"authenticity_token", "rails-ujs"}, map[string]string{"x-powered-by": "Phusion Passenger", "x-rails-version": ""}},
-	{TechLaravel, []string{"laravel_session", "XSRF-TOKEN"}, map[string]string{"set-cookie": "laravel_session"}},
-	{TechSpring, []string{"Whitelabel Error Page", "spring.io"}, map[string]string{"x-application-context": ""}},
-	{TechPHP, []string{"<?php", ".php?"}, map[string]string{"x-powered-by": "PHP"}},
+	{TechLaravel, []string{}, map[string]string{"set-cookie": "laravel_session"}},
+	{TechSpring, []string{"Whitelabel Error Page"}, map[string]string{"x-application-context": ""}},
+	{TechPHP, []string{`.php"`, ".php?"}, map[string]string{"x-powered-by": "PHP", "set-cookie": "PHPSESSID"}},
 	{TechNodeJS, []string{}, map[string]string{"x-powered-by": "Express"}},
 	{TechAspNet, []string{"__VIEWSTATE", "__EVENTVALIDATION"}, map[string]string{"x-powered-by": "ASP.NET", "x-aspnet-version": ""}},
 }
@@ -115,15 +115,15 @@ var techWords = map[Tech][]string{
 	},
 	TechDrupal: {
 		"user/login", "user/register", "user/password", "admin", "admin/config",
-		"CHANGELOG.txt", "update.php", "install.php", "node/1", "?q=user",
+		"CHANGELOG.txt", "update.php", "install.php", "node/1",
 	},
 	TechJoomla: {
 		"administrator", "administrator/index.php", "administrator/manifests",
-		"configuration.php", "configuration.php.bak", "cache/", "logs/", "tmp/",
+		"configuration.php", "configuration.php.bak", "cache", "logs", "tmp",
 	},
 	TechDjango: {
 		"admin", "admin/login", "admin/password_reset", "accounts/login", "accounts/password_reset",
-		"__debug__", "static/admin/", "api-auth", "swagger", "redoc",
+		"__debug__", "static/admin", "api-auth", "swagger", "redoc",
 	},
 	TechRails: {
 		"rails/info/routes", "rails/info/properties", "rails/mailers", "rails/db",

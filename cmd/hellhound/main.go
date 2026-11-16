@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -80,6 +81,10 @@ func main() {
 		os.Exit(2)
 	}
 	baseURL := strings.TrimRight(*target, "/")
+	if err := validateTarget(baseURL); err != nil {
+		fmt.Fprintf(os.Stderr, "hellhound: invalid target %q: %v\n", *target, err)
+		os.Exit(2)
+	}
 
 	cfg := engine.DefaultConfig()
 	cfg.Concurrency = *concurrency
@@ -112,6 +117,15 @@ func main() {
 	// interrupt still gets reported below.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Fail fast on an unreachable target. Without this every phase runs
+	// against nothing and the run ends with a clean-looking "0 findings",
+	// exit 0 — indistinguishable from a real scan of a clean target.
+	if pre := eng.DoAll(ctx, []engine.Request{{Method: "GET", URL: baseURL + "/"}}); len(pre) == 1 && pre[0].Err != nil && ctx.Err() == nil {
+		fmt.Fprintf(os.Stderr, "hellhound: target is not reachable: %v\n", pre[0].Err)
+		fmt.Fprintln(os.Stderr, "hellhound: nothing was scanned (check the URL, scheme and port; use -k for a self-signed certificate on an authorized dev/staging target)")
+		os.Exit(1)
+	}
 
 	seed := wordlist.Merge(wordlist.Seed, loadWordlistFile(*wordlistPath))
 	words := seed
@@ -266,6 +280,25 @@ func runSecurityScans(ctx context.Context, eng *engine.Engine, baseURL string, r
 
 	fmt.Fprintf(os.Stderr, "hellhound: security checks done in %s — %d finding(s)\n", time.Since(start).Round(time.Millisecond), len(findings))
 	return findings
+}
+
+// validateTarget rejects a -u value that is not an absolute http(s) URL —
+// most commonly a host typed without its scheme.
+func validateTarget(raw string) error {
+	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
+		return fmt.Errorf("URL must start with http:// or https://")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("URL must start with http:// or https://")
+	}
+	if u.Host == "" {
+		return fmt.Errorf("URL has no host")
+	}
+	return nil
 }
 
 // writeOutput writes rep to path using the given format writer, exiting on

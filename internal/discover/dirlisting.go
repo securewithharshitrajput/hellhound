@@ -6,22 +6,15 @@
 // the operator triage them straight to the top.
 package discover
 
-import "bytes"
+import "regexp"
 
-// dirListingMarkers are strings whose presence in a response body strongly
-// suggests the body is a directory listing rather than a real content page.
-// Different servers produce different stock listings; the set below covers
-// the common three (Apache / nginx / python -m http.server) and a few less
-// common ones.
-var dirListingMarkers = [][]byte{
-	[]byte("<title>Index of /"),
-	[]byte("<h1>Index of /"),
-	[]byte("[DIR]"),
-	[]byte("Parent Directory</a>"),
-	[]byte("Directory listing for "), // python's http.server
-	[]byte("Last modified</a>"),
-	[]byte("<pre><a href=\"../\">"),
-}
+// dirListingRe matches the heading a server-generated index page carries:
+// Apache/nginx/lighttpd "Index of /path", Python http.server "Directory
+// listing for /path", and IIS's "[To Parent Directory]" link. The match is
+// anchored to the <title>/<h1> element (or the IIS link text) because looser
+// markers such as "[DIR]" or a "Last modified" column also appear on
+// ordinary documentation and changelog pages.
+var dirListingRe = regexp.MustCompile(`(?i)<(?:title|h1)>\s*(?:Index of|Directory listing for)\s+/[^<]*</(?:title|h1)>|\[To Parent Directory\]</a>`)
 
 // ClassifyDirListings scans the Results' BodyPreview fields and promotes
 // those matching a directory-listing fingerprint into a dedicated
@@ -50,18 +43,15 @@ func ClassifyDirListings(results []Result) []SecurityFinding {
 	return out
 }
 
-// DetectDirListing returns the first matching marker preview and true if
-// body looks like a dir listing. Exported so other callers (crawler, etc.)
-// can reuse the same classifier.
+// DetectDirListing returns the matching heading and true if body looks like
+// a server-generated directory index.
 func DetectDirListing(body []byte) (string, bool) {
-	for _, m := range dirListingMarkers {
-		if idx := bytes.Index(body, m); idx >= 0 {
-			end := idx + len(m) + 40
-			if end > len(body) {
-				end = len(body)
-			}
-			return string(body[idx:end]), true
-		}
+	m := dirListingRe.Find(body)
+	if m == nil {
+		return "", false
 	}
-	return "", false
+	if len(m) > 100 {
+		m = m[:100]
+	}
+	return string(m), true
 }

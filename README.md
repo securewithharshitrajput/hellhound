@@ -67,10 +67,10 @@ flowchart LR
 ## Install
 
 ```bash
-go install github.com/securewithharshitrajput/hellhound/cmd/hellhound@v0.6.0
+go install github.com/securewithharshitrajput/hellhound/cmd/hellhound@v0.6.1
 ```
 
-(Pin to a tagged version like `@v0.6.0` rather than `@latest` — Go's module proxy caches version lookups, and `@latest` against an untagged commit can serve a stale result until the proxy's cache naturally refreshes. A tagged release doesn't have that problem.)
+(Pin to a tagged version like `@v0.6.1` rather than `@latest` — Go's module proxy caches version lookups, and `@latest` against an untagged commit can serve a stale result until the proxy's cache naturally refreshes. A tagged release doesn't have that problem.)
 
 This drops a `hellhound` binary into `$(go env GOBIN)` (usually `~/go/bin`) — the same place `ffuf`/`katana` live. Make sure that's on your `PATH` and you're done:
 
@@ -135,10 +135,10 @@ hellhound: 21 findings in 9 cluster(s) for http://target.tld
 [security] 6 finding(s):
   [HIGH  ] sensitive-file  http://target.tld/.env
         environment file commonly contains database and API credentials
-        evidence: DB_PASSWORD=hunter2 SECRET_KEY=abc...
+        evidence: variables: APP_ENV, DB_PASSWORD, SECRET_KEY (values redacted)
   [HIGH  ] sensitive-file  http://target.tld/.git/config
         .git directory exposed — attacker can reconstruct full source tree
-        evidence: [core]  repositoryformatversion = 0 [remote "o
+        evidence: [core]
   [MEDIUM] dangerous-methods  http://target.tld/api/users
         server advertises PUT, DELETE, PATCH via OPTIONS Allow header
         evidence: GET, POST, PUT, DELETE, PATCH, OPTIONS
@@ -206,6 +206,16 @@ Hellhound classifies each endpoint it discovers against a dedicated set of secur
 | **open-redirect** | Any discovered URL whose query carries a redirect-shaped parameter (`url`, `next`, `redirect`, `redirect_uri`, `goto`, `return`, `callback`, …) is re-sent with a canary external URL; a 3xx `Location:` reflecting it is flagged | MEDIUM |
 | **info-disclosure** | `Server`, `X-Powered-By`, `X-AspNet-Version`, `X-Rails-Version`, `X-Generator`, `X-Application-Context`, etc. — deduplicated per host so a 10,000-request scan doesn't flood with the same banner | LOW / INFO |
 
+These checks are built to stay quiet on targets that answer `200` for everything (single-page apps, WAF block pages, catch-all routers):
+
+- **sensitive-file** needs a file-specific structural match (an env assignment line, a key header, a file magic, a JSON key), rejects HTML documents, and rejects any response shaped like what the target returns for random nonexistent files.
+- **dangerous-methods** probes a random nonexistent path per origin; a blanket `Allow` header is reported once for the origin instead of once per URL.
+- **open-redirect** requires the `Location` host to be the canary itself — a same-site bounce that carries the parameter along (`/login?next=...`) is not flagged.
+- **info-disclosure** reports per-response values (`X-Runtime`, `X-Varnish`, `Via`, ...) once per host.
+- Evidence never repeats secret values: env files list variable names only, and excerpts stop at the matched marker.
+
+Hellhound also refuses to "scan" a target it cannot reach: an unreachable host or a URL without `http://`/`https://` ends the run with an error and a non-zero exit code instead of a clean-looking `0 findings`.
+
 ---
 
 ## Testing
@@ -219,7 +229,7 @@ This isn't "it compiled, ship it." The analyzer and engine were deliberately put
 - **50,000-word stress test** against a live server — found and fixed a ~0.1% false-positive edge case in redaction ordering
 - **Goroutine leak checks** across repeated scans
 
-100+ tests passing (every new Tier-A detector carries its own fingerprint and false-positive-rejection regression tests), `go vet` and `gofmt` clean, zero known crashes.
+116 tests and fuzz targets passing (every Tier-A detector carries fingerprint, false-positive-rejection and catch-all-target regression tests, plus fuzzing of everything that parses target-controlled bodies and headers), `go vet` and `gofmt` clean, zero known crashes.
 
 ```bash
 go test ./...

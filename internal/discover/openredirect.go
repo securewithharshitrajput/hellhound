@@ -112,23 +112,29 @@ func ScanOpenRedirects(ctx context.Context, eng *engine.Engine, candidates []str
 	return out
 }
 
-// redirectsExternally returns true when loc would send a browser to an
-// attacker-controlled destination — either a canary absolute URL or a
-// protocol-relative "//host/..." that browsers resolve as external.
+// canaryHost is the host of openRedirectCanary.
+const canaryHost = "example.org"
+
+// redirectsExternally returns true when loc would send a browser to the
+// canary host itself — as an absolute URL or a protocol-relative
+// "//host/..." reference. The host must match exactly: a same-site redirect
+// that merely carries the canary inside its own query string (the usual
+// "bounce to /login?next=...") is not an open redirect, and neither is a
+// lookalike host.
 func redirectsExternally(loc string) bool {
-	if loc == "" {
+	trimmed := strings.TrimSpace(loc)
+	if trimmed == "" {
 		return false
 	}
-	trimmed := strings.TrimSpace(loc)
-	// Protocol-relative // paths are external in a browser context.
-	if strings.HasPrefix(trimmed, "//") && strings.Contains(trimmed, "example.org") {
-		return true
+	// Browsers treat backslashes as slashes in the authority position.
+	if strings.HasPrefix(trimmed, `\\`) || strings.HasPrefix(trimmed, `/\`) {
+		trimmed = "//" + trimmed[2:]
 	}
 	u, err := url.Parse(trimmed)
-	if err != nil || u.Host == "" {
+	if err != nil {
 		return false
 	}
-	return strings.Contains(strings.ToLower(u.Host), "example.org")
+	return strings.EqualFold(u.Hostname(), canaryHost)
 }
 
 // cloneValues makes an independent copy of a url.Values so modifying it
