@@ -9,6 +9,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -40,7 +41,14 @@ func (h headerFlag) Set(v string) error {
 	if !ok {
 		return fmt.Errorf("expected \"Name: value\", got %q", v)
 	}
-	h[strings.TrimSpace(k)] = strings.TrimSpace(val)
+	k, val = strings.TrimSpace(k), strings.TrimSpace(val)
+	if k == "" || strings.ContainsAny(k, " \t\r\n\"(),/:;<=>?@[\\]{}") {
+		return fmt.Errorf("%q is not a valid header name", k)
+	}
+	if strings.ContainsAny(val, "\r\n\x00") {
+		return fmt.Errorf("header %s: the value must be a single line", k)
+	}
+	h[k] = val
 	return nil
 }
 
@@ -80,9 +88,27 @@ func main() {
 		fmt.Fprintln(os.Stderr, "\nFor authorized security testing only — only point this at targets you are authorized to test.")
 		os.Exit(2)
 	}
-	baseURL := strings.TrimRight(*target, "/")
-	if err := validateTarget(baseURL); err != nil {
+	if err := validateFlags(*concurrency, *depth, *calibN, *rate, *maxBodyKB, *crawlDepth, *crawlMax, *timeout); err != nil {
+		fmt.Fprintf(os.Stderr, "hellhound: %v\n", err)
+		os.Exit(2)
+	}
+	baseURL, err := normalizeTarget(*target)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "hellhound: invalid target %q: %v\n", *target, err)
+		os.Exit(2)
+	}
+	// Input and output files are checked before anything is sent: a typo in
+	// -w must not silently fall back to the built-in list, and an
+	// unwritable report path must not be discovered after the scan.
+	userWords, err := readListFile("-w", *wordlistPath)
+	if err == nil && *vhostFile != "" {
+		_, err = readListFile("-vhosts", *vhostFile)
+	}
+	if err == nil {
+		err = checkWritable(*jsonOut, *csvOut, *sarifOut)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hellhound: %v\n", err)
 		os.Exit(2)
 	}
 
@@ -117,6 +143,13 @@ func main() {
 	// interrupt still gets reported below.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// The first interrupt winds the scan down and prints partial results.
+	// Restore default signal handling as soon as it arrives, so a second
+	// Ctrl+C always terminates the process immediately.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 
 	// Fail fast on an unreachable target. Without this every phase runs
 	// against nothing and the run ends with a clean-looking "0 findings",
@@ -127,7 +160,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	seed := wordlist.Merge(wordlist.Seed, loadWordlistFile(*wordlistPath))
+	seed := wordlist.Merge(wordlist.Seed, userWords)
 	words := seed
 	if !*noMine {
 		fmt.Fprintf(os.Stderr, "hellhound: mining robots.txt + homepage + linked JS for target-derived words...\n")
@@ -181,9 +214,14 @@ func main() {
 	if *extStr != "" {
 		for _, e := range strings.Split(*extStr, ",") {
 			e = strings.TrimSpace(e)
-			if e != "" {
-				exts = append(exts, e)
+			if e == "" {
+				continue
 			}
+			if !validExt(e) {
+				fmt.Fprintf(os.Stderr, "hellhound: invalid -ext entry %q: an extension starts with '.' or '~' and contains only letters, digits, '.', '_', '-' and '~' (e.g. .bak,.old,~)\n", e)
+				os.Exit(2)
+			}
+			exts = append(exts, e)
 		}
 	}
 
@@ -194,7 +232,7 @@ func main() {
 		MaxDepth:     *depth,
 		Extensions:   exts,
 		OnWarning: func(dir string, err error) {
-			fmt.Fprintf(os.Stderr, "hellhound: warning: scanning %s: %v (continuing)\n", dir, err)
+			fmt.Fprintf(os.Stderr, "hellhound: warning: scanning %s: %s (continuing)\n", report.Clean(dir), report.Clean(err.Error()))
 		},
 	})
 
@@ -228,7 +266,7 @@ func main() {
 	if !*noSecurity && ctx.Err() == nil {
 		allResults := append([]discover.Result{}, results...)
 		allResults = append(allResults, discover.AsResults(crawlResults)...)
-		rep.SecurityFindings = append(rep.SecurityFindings, runSecurityScans(ctx, eng, baseURL, allResults)...)
+		rep.SecurityFindings = report.CleanFindings(runSecurityScans(ctx, eng, baseURL, allResults))
 	}
 
 	report.WriteSummary(os.Stdout, rep)
@@ -244,6 +282,13 @@ func main() {
 	writeOutput("JSON", *jsonOut, rep, report.WriteJSON)
 	writeOutput("CSV", *csvOut, rep, report.WriteCSV)
 	writeOutput("SARIF", *sarifOut, rep, report.WriteSARIF)
+
+	if ctx.Err() != nil {
+		// Partial results were printed and written, but the scan did not
+		// finish: exit like any interrupted program so scripts and CI do
+		// not mistake it for a completed run.
+		os.Exit(130)
+	}
 }
 
 // runSecurityScans runs every Tier-A detector concurrently and merges the
@@ -256,7 +301,11 @@ func runSecurityScans(ctx context.Context, eng *engine.Engine, baseURL string, r
 	var findings []discover.SecurityFinding
 
 	// 1) Sensitive file probes (dedicated path list, concurrent batch).
-	findings = append(findings, discover.ScanSensitive(ctx, eng, baseURL)...)
+	sens, skipped := discover.ScanSensitiveAll(ctx, eng, baseURL, results)
+	findings = append(findings, sens...)
+	if skipped > 0 {
+		fmt.Fprintf(os.Stderr, "hellhound: sensitive-file probes ran at the root and the first 10 discovered directories; %d more directories were not probed\n", skipped)
+	}
 
 	// 2) Dir-listing classification (zero extra requests, uses already-captured bodies).
 	findings = append(findings, discover.ClassifyDirListings(results)...)
@@ -282,21 +331,111 @@ func runSecurityScans(ctx context.Context, eng *engine.Engine, baseURL string, r
 	return findings
 }
 
-// validateTarget rejects a -u value that is not an absolute http(s) URL —
-// most commonly a host typed without its scheme.
-func validateTarget(raw string) error {
-	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
-		return fmt.Errorf("URL must start with http:// or https://")
+// validateFlags rejects numeric flag values that cannot produce a meaningful
+// scan, with a message naming the flag, instead of hanging, panicking or
+// silently doing something else.
+func validateFlags(concurrency, depth, calibN, rate, maxBodyKB, crawlDepth, crawlMax int, timeout time.Duration) error {
+	switch {
+	case concurrency < 1 || concurrency > 1000:
+		return fmt.Errorf("-c must be between 1 and 1000 (got %d)", concurrency)
+	case depth < 0:
+		return fmt.Errorf("-depth must be 0 or more (got %d)", depth)
+	case calibN < 2:
+		return fmt.Errorf("-calibrate must be at least 2 (got %d): fewer probes cannot tell a stable not-found page from a changing one", calibN)
+	case rate < 0:
+		return fmt.Errorf("-rate must be 0 (unlimited) or more (got %d)", rate)
+	case maxBodyKB < 1:
+		return fmt.Errorf("-maxbody must be at least 1 KB (got %d)", maxBodyKB)
+	case crawlDepth < 1:
+		return fmt.Errorf("-crawl-depth must be at least 1 (got %d)", crawlDepth)
+	case crawlMax < 1:
+		return fmt.Errorf("-crawl-max must be at least 1 (got %d)", crawlMax)
+	case timeout < 100*time.Millisecond:
+		return fmt.Errorf("-timeout must be at least 100ms (got %s)", timeout)
+	}
+	return nil
+}
+
+// normalizeTarget validates -u and returns the base URL every phase builds
+// on: an absolute http(s) URL with a lowercase scheme, an optional path
+// prefix, no trailing slash, and nothing that cannot be scanned as a
+// directory (query string, fragment) or that would end up in reports
+// (embedded credentials).
+func normalizeTarget(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	lower := strings.ToLower(raw)
+	if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
+		return "", fmt.Errorf("URL must start with http:// or https://")
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return err
+		return "", err
 	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("URL must start with http:// or https://")
+	switch {
+	case u.Hostname() == "":
+		return "", fmt.Errorf("URL has no host")
+	case u.RawQuery != "" || u.ForceQuery:
+		return "", fmt.Errorf("URL must not contain a query string — give the base URL to scan under, e.g. %s://%s%s", strings.ToLower(u.Scheme), u.Host, u.Path)
+	case u.Fragment != "" || strings.Contains(raw, "#"):
+		return "", fmt.Errorf("URL must not contain a #fragment")
+	case u.User != nil:
+		return "", fmt.Errorf("URL must not embed credentials (they would be written into every report line); pass them with -H \"Authorization: Basic <base64 user:pass>\"")
 	}
-	if u.Host == "" {
-		return fmt.Errorf("URL has no host")
+	u.Scheme = strings.ToLower(u.Scheme)
+	return strings.TrimRight(u.Scheme+"://"+u.Host+u.EscapedPath(), "/"), nil
+}
+
+// validExt reports whether e is a plausible file extension or backup suffix.
+func validExt(e string) bool {
+	if e[0] != '.' && e[0] != '~' {
+		return false
+	}
+	for i := 0; i < len(e); i++ {
+		c := e[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '-' || c == '~') {
+			return false
+		}
+	}
+	return !strings.Contains(e, "..")
+}
+
+// readListFile loads a one-entry-per-line file given with a flag. Unlike a
+// warning-and-continue, a file that was asked for but cannot be read is an
+// error: the scan the operator wanted is not the scan that would run.
+func readListFile(flagName, path string) ([]string, error) {
+	if path == "" {
+		return nil, nil
+	}
+	if st, err := os.Stat(path); err == nil && st.IsDir() {
+		return nil, fmt.Errorf("%s %s is a directory, not a file", flagName, path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read %s file: %v", flagName, err)
+	}
+	out := parseList(data)
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s %s contains no usable entries", flagName, path)
+	}
+	return out, nil
+}
+
+// checkWritable makes sure each requested report file can be created,
+// without truncating an existing one yet.
+func checkWritable(paths ...string) error {
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		_, statErr := os.Stat(p)
+		f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE, 0o644)
+		if err != nil {
+			return fmt.Errorf("cannot write report file: %v", err)
+		}
+		f.Close()
+		if os.IsNotExist(statErr) {
+			os.Remove(p) // leave no empty file behind if the scan is aborted
+		}
 	}
 	return nil
 }
@@ -395,7 +534,7 @@ func runAPIDiscovery(ctx context.Context, eng *engine.Engine, baseURL string) {
 			}
 			fmt.Printf("\n[openapi] spec found at %s — %d routes declared:\n", p, len(routes))
 			for _, r := range routes {
-				fmt.Printf("    %-7s %s\n", r.Method, r.Path)
+				fmt.Printf("    %-7s %s\n", report.Clean(r.Method), report.Clean(r.Path))
 			}
 		case probeGraphQL:
 			fields, err := discover.ParseGraphQLIntrospection(resp.Body)
@@ -410,7 +549,7 @@ func runAPIDiscovery(ctx context.Context, eng *engine.Engine, baseURL string) {
 			}
 			fmt.Printf("\n[graphql] introspection enabled at %s — %d root fields exposed:\n", p, len(fields))
 			for _, f := range fields {
-				fmt.Printf("    %s.%s\n", f.ParentType, f.Field)
+				fmt.Printf("    %s.%s\n", report.Clean(f.ParentType), report.Clean(f.Field))
 			}
 		}
 	}
@@ -437,7 +576,7 @@ func runVHostScan(ctx context.Context, eng *engine.Engine, baseURL, vhostFile st
 	}
 	fmt.Printf("\n[vhost] %d distinct virtual host(s) found:\n", len(results))
 	for _, r := range results {
-		fmt.Printf("    %-40s [%d] len=%d  %s\n", r.Host, r.Status, r.Length, r.Reason)
+		fmt.Printf("    %-40s [%d] len=%d  %s\n", report.Clean(r.Host), r.Status, r.Length, report.Clean(r.Reason))
 	}
 }
 
@@ -453,7 +592,7 @@ func runCrawl(ctx context.Context, eng *engine.Engine, baseURL string, depth, ma
 	} else {
 		fmt.Printf("\n[crawl] %d linked page(s) found by following links:\n", len(results))
 		for _, r := range results {
-			fmt.Printf("    [%d] (depth %d) %s\n", r.Status, r.Depth, r.URL)
+			fmt.Printf("    [%d] (depth %d) %s\n", r.Status, r.Depth, report.Clean(r.URL))
 		}
 	}
 	fmt.Fprintf(os.Stderr, "hellhound: crawl done in %s\n", time.Since(start).Round(time.Millisecond))
@@ -469,12 +608,23 @@ func loadWordlistFile(path string) []string {
 		fmt.Fprintf(os.Stderr, "hellhound: warning: could not read wordlist %s: %v\n", path, err)
 		return nil
 	}
+	return parseList(data)
+}
+
+// parseList splits a list file into entries: one per line, surrounding
+// whitespace and a UTF-8 byte-order mark removed, blank lines and
+// #-comments skipped, duplicates dropped.
+func parseList(data []byte) []string {
+	data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
+	seen := map[string]bool{}
 	var out []string
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
-		if line != "" && !strings.HasPrefix(line, "#") {
-			out = append(out, line)
+		if line == "" || strings.HasPrefix(line, "#") || seen[line] {
+			continue
 		}
+		seen[line] = true
+		out = append(out, line)
 	}
 	return out
 }

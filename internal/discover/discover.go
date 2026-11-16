@@ -49,6 +49,9 @@ type Result struct {
 	// as potentially information-disclosing (Server, X-Powered-By, etc.) —
 	// not the full header map, to keep Results cheap.
 	Headers map[string]string
+	// path is the candidate path exactly as classified (before URL
+	// encoding), kept so a finding can be re-requested and re-classified.
+	path string
 }
 
 const resultBodyPreviewCap = 8 * 1024
@@ -70,6 +73,15 @@ type Discoverer struct {
 	eng  *engine.Engine
 	cal  *analyze.Calibrator
 	opts Options
+	// basePath is the path component of opts.BaseURL ("" for a target at
+	// the server root). Directories are tracked relative to it.
+	basePath string
+	// caseTested / caseInsensitive record whether the target treats paths
+	// case-insensitively (IIS, many Windows and macOS-hosted apps), learned
+	// once from the first suitable hit.
+	caseTested      bool
+	caseInsensitive bool
+	warnedUnstable  bool
 }
 
 func New(eng *engine.Engine, opts Options) *Discoverer {
@@ -90,10 +102,13 @@ func New(eng *engine.Engine, opts Options) *Discoverer {
 	if opts.OnWarning == nil {
 		opts.OnWarning = func(string, error) {}
 	}
+	opts.BaseURL = strings.TrimRight(opts.BaseURL, "/")
+	base := strings.TrimRight(urlPath(opts.BaseURL), "/")
 	return &Discoverer{
-		eng:  eng,
-		cal:  analyze.NewCalibrator(),
-		opts: opts,
+		eng:      eng,
+		cal:      analyze.NewCalibrator(),
+		opts:     opts,
+		basePath: base,
 	}
 }
 
@@ -110,6 +125,10 @@ func (d *Discoverer) Run(ctx context.Context, baseDir string) ([]Result, error) 
 		depth := depthOf[dir]
 
 		results, err := d.scanDir(ctx, dir, depth)
+		d.detectCaseInsensitivity(ctx, results)
+		if d.caseInsensitive {
+			results = foldCase(all, results)
+		}
 		all = append(all, results...) // keep whatever we got even if err != nil below
 		if err != nil {
 			d.opts.OnWarning(dir, err)
@@ -123,8 +142,19 @@ func (d *Discoverer) Run(ctx context.Context, baseDir string) ([]Result, error) 
 			continue
 		}
 		for _, next := range prioritizeRecursion(results) {
-			if _, seen := depthOf[next]; !seen {
-				depthOf[next] = depth + 1
+			// Result URLs include the target's own base path; directories
+			// are relative to it, or "-u http://host/app" would recurse
+			// into /app/app/...
+			next = normalizeDir(strings.TrimPrefix(next, d.basePath))
+			key := next
+			if d.caseInsensitive {
+				key = strings.ToLower(next)
+			}
+			if _, seen := depthOf[key]; !seen {
+				depthOf[key] = depth + 1
+				if key != next {
+					depthOf[next] = depth + 1
+				}
 				queue = append(queue, next)
 			}
 		}
@@ -172,11 +202,37 @@ func (d *Discoverer) scanDir(ctx context.Context, dir string, depth int) ([]Resu
 	if len(probes) > 0 && failed == len(probes) {
 		d.opts.OnWarning(dir, fmt.Errorf("all %d calibration probes failed — target may be unreachable, the URL may be malformed, or TLS verification is failing (use -k to skip it, only for authorized dev/staging testing): %w", failed, lastErr))
 	}
-	d.cal.Learn(dir, probes)
+	if b := d.cal.Learn(dir, probes); b.Unstable() && ctx.Err() == nil {
+		// The not-found responses differ from one another, so one shape
+		// cannot describe them. Double the sample so the vocabulary model
+		// that takes over is built from enough pages, and say so: results
+		// here are filtered more aggressively and may be incomplete.
+		extra := d.opts.CalibrationN
+		if extra < 6 {
+			extra = 6
+		}
+		more := make([]engine.Request, extra)
+		moreTokens := make([]string, len(more))
+		for i := range more {
+			moreTokens[i] = analyze.RandomToken()
+			more[i] = engine.Request{Method: "GET", URL: d.opts.BaseURL + joinDir(dir, moreTokens[i])}
+		}
+		for i, r := range d.eng.DoAll(ctx, more) {
+			probes = append(probes, analyze.Probe{Token: moreTokens[i], Resp: r})
+		}
+		d.cal.Learn(dir, probes)
+		if !d.warnedUnstable {
+			d.warnedUnstable = true
+			d.opts.OnWarning(dir, fmt.Errorf("this target answers unknown paths with content that changes on every request; switched to vocabulary-based filtering — a real page that reuses the same wording may be missed"))
+		}
+	}
 
 	candidates := make([]string, 0, len(d.opts.Wordlist)*len(d.opts.Extensions))
 	for _, w := range d.opts.Wordlist {
 		for _, ext := range d.opts.Extensions {
+			if w = strings.TrimLeft(w, "/"); w == "" {
+				continue
+			}
 			candidates = append(candidates, joinDir(dir, w+ext))
 		}
 	}
@@ -188,15 +244,18 @@ func (d *Discoverer) scanDir(ctx context.Context, dir string, depth int) ([]Resu
 			select {
 			case <-ctx.Done():
 				return
-			case reqs <- engine.Request{Method: "GET", URL: d.opts.BaseURL + c, Meta: c}:
+			case reqs <- engine.Request{Method: "GET", URL: d.opts.BaseURL + encodePath(c), Meta: c}:
 			}
 		}
 	}()
 
 	var results []Result
-	total := 0
+	total, rateLimited := 0, 0
 	for resp := range d.eng.Run(ctx, reqs) {
 		total++
+		if resp.Err == nil && resp.Status == 429 {
+			rateLimited++
+		}
 		path, _ := resp.Req.Meta.(string)
 		v := d.cal.Classify(dir, path, resp)
 		if !v.Interesting {
@@ -214,9 +273,13 @@ func (d *Discoverer) scanDir(ctx context.Context, dir string, depth int) ([]Resu
 			Verdict:     v,
 			BodyPreview: previewOf(resp.Body, resp.Header.Get("Content-Type")),
 			Headers:     captureHeaders(resp.Header),
+			path:        path,
 		})
 	}
 
+	if rateLimited > 0 {
+		d.opts.OnWarning(dir, fmt.Errorf("%d of %d requests were still rate-limited (429) after backing off, so those paths were not checked — re-run with a lower -rate or -c", rateLimited, total))
+	}
 	results = d.recalibrateIfDrifted(ctx, dir, results, total)
 	return results, nil
 }
@@ -232,6 +295,9 @@ const (
 	// so far beyond plausible that it unambiguously means "the baseline
 	// learned up front no longer describes what the target is returning."
 	driftHitRate = 0.30
+	// driftMinHits is how many hits a small scan needs before an
+	// implausible hit rate triggers re-verification.
+	driftMinHits = 5
 )
 
 // recalibrateIfDrifted defends against a target that changes behavior
@@ -252,10 +318,17 @@ const (
 // handful of fresh probes — it will not re-hammer an already-struggling
 // target.
 func (d *Discoverer) recalibrateIfDrifted(ctx context.Context, dir string, results []Result, total int) []Result {
-	if total < driftMinSample || len(results) == 0 {
+	if len(results) == 0 || total == 0 || float64(len(results))/float64(total) <= driftHitRate {
 		return results
 	}
-	if float64(len(results))/float64(total) <= driftHitRate {
+	if total < driftMinSample {
+		// Too few candidates for the hit rate alone to prove drift (a short,
+		// curated wordlist can legitimately hit often), but enough hits to
+		// be worth confirming: re-checking costs a few requests and genuine
+		// findings survive it.
+		if len(results) >= driftMinHits {
+			return d.reverify(ctx, dir, results, total)
+		}
 		return results
 	}
 
@@ -298,6 +371,57 @@ func (d *Discoverer) recalibrateIfDrifted(ctx context.Context, dir string, resul
 		pct := 100 * float64(len(results)) / float64(total)
 		d.opts.OnWarning(dir, fmt.Errorf("hit rate %.0f%% is implausibly high — target likely began serving a block/challenge/wildcard page mid-scan; re-calibrated and dropped %d finding(s) that match the target's new behavior", pct, dropped))
 	}
+	if float64(len(kept))/float64(total) > driftHitRate {
+		kept = d.reverify(ctx, dir, kept, total)
+	}
+	return kept
+}
+
+// reverify is the last line of defence against a flood: the hit rate is
+// still implausible after dropping findings that match fresh probes, which
+// means the up-front calibration did not capture how this directory
+// answers unknown paths (too few probes, or pages that vary more than the
+// sample showed). It learns the baseline again from a larger sample and
+// re-requests every remaining finding, keeping only those that still stand
+// out.
+func (d *Discoverer) reverify(ctx context.Context, dir string, results []Result, total int) []Result {
+	n := 2 * d.opts.CalibrationN
+	if n < 12 {
+		n = 12
+	}
+	reqs := make([]engine.Request, n)
+	tokens := make([]string, n)
+	for i := range reqs {
+		tokens[i] = analyze.RandomToken()
+		reqs[i] = engine.Request{Method: "GET", URL: d.opts.BaseURL + joinDir(dir, tokens[i])}
+	}
+	probes := make([]analyze.Probe, 0, n)
+	for i, r := range d.eng.DoAll(ctx, reqs) {
+		probes = append(probes, analyze.Probe{Token: tokens[i], Resp: r})
+	}
+	d.cal.Learn(dir, probes)
+
+	again := make([]engine.Request, len(results))
+	for i, res := range results {
+		again[i] = engine.Request{Method: "GET", URL: res.URL}
+	}
+	kept := results[:0]
+	for i, resp := range d.eng.DoAll(ctx, again) {
+		res := results[i]
+		if ctx.Err() != nil {
+			kept = append(kept, res) // interrupted: keep what was not re-checked
+			continue
+		}
+		p := res.path
+		if p == "" {
+			p = strings.TrimPrefix(urlPath(res.URL), d.basePath)
+		}
+		if v := d.cal.Classify(dir, p, resp); v.Interesting {
+			res.Verdict = v
+			kept = append(kept, res)
+		}
+	}
+	d.opts.OnWarning(dir, fmt.Errorf("%d of %d paths still looked like hits after re-calibration, which is implausible; learned the baseline again from %d probes and re-checked each one — %d remain", len(results), total, n, len(kept)))
 	return kept
 }
 
@@ -325,6 +449,9 @@ func prioritizeRecursion(results []Result) []string {
 // endpoint ("/graphql", "/api/v1/users") that structurally cannot have
 // meaningful children.
 func looksLikeDirectory(r Result) bool {
+	if strings.ContainsAny(urlPath(r.URL), "?#") {
+		return false // a URL with a query string is an endpoint, not a directory
+	}
 	seg := lastSeg(urlPath(r.URL))
 	if strings.Contains(seg, ".") {
 		return false // looks like a file (app.js, config.bak), not a directory
@@ -455,4 +582,111 @@ func captureHeaders(h map[string][]string) map[string]string {
 		}
 	}
 	return out
+}
+
+// detectCaseInsensitivity learns, once, whether the target serves the same
+// resource for a path regardless of letter case. It re-requests one real
+// hit with its case flipped; the same status and shape means the server
+// folds case, and "/Admin", "/ADMIN" and "/admin" are one finding.
+func (d *Discoverer) detectCaseInsensitivity(ctx context.Context, results []Result) {
+	if d.caseTested || ctx.Err() != nil {
+		return
+	}
+	for _, r := range results {
+		if r.Status < 200 || r.Status >= 300 {
+			continue
+		}
+		p := urlPath(r.URL)
+		if strings.ContainsAny(p, "?#") {
+			continue
+		}
+		flipped := flipCase(p)
+		if flipped == p {
+			continue
+		}
+		d.caseTested = true
+		origin := strings.TrimSuffix(d.opts.BaseURL, d.basePath)
+		resps := d.eng.DoAll(ctx, []engine.Request{{Method: "GET", URL: origin + flipped}})
+		if len(resps) != 1 || resps[0].Err != nil || resps[0].Status != r.Status {
+			return
+		}
+		h := analyze.SimHash(resps[0].Body, flipped, lastSeg(flipped))
+		d.caseInsensitive = analyze.SimilarShape(h, r.Verdict.ClusterKey)
+		if d.caseInsensitive {
+			d.opts.OnWarning("/", fmt.Errorf("target treats paths case-insensitively; findings that differ only by letter case are merged"))
+		}
+		return
+	}
+}
+
+// flipCase swaps the case of every ASCII letter in the last path segment.
+func flipCase(p string) string {
+	i := strings.LastIndex(p, "/") + 1
+	b := []byte(p)
+	for j := i; j < len(b); j++ {
+		switch c := b[j]; {
+		case c >= 'a' && c <= 'z':
+			b[j] = c - 32
+		case c >= 'A' && c <= 'Z':
+			b[j] = c + 32
+		}
+	}
+	return string(b)
+}
+
+// foldCase drops results whose URL differs only by letter case from one
+// already kept (in earlier directories or earlier in this batch), keeping
+// the all-lowercase spelling when the batch offers one.
+func foldCase(kept, batch []Result) []Result {
+	seen := make(map[string]bool, len(kept))
+	for _, r := range kept {
+		seen[strings.ToLower(r.URL)] = true
+	}
+	idx := map[string]int{}
+	var out []Result
+	for _, r := range batch {
+		k := strings.ToLower(r.URL)
+		if seen[k] {
+			continue
+		}
+		if i, ok := idx[k]; ok {
+			if r.URL == k && out[i].URL != k {
+				out[i] = r
+			}
+			continue
+		}
+		idx[k] = len(out)
+		out = append(out, r)
+	}
+	return out
+}
+
+// encodePath makes a candidate path safe to put in a request URL without
+// changing what the wordlist author meant. '/' and an existing query string
+// are kept, valid %XX escapes are kept (wordlists ship pre-encoded
+// entries), and everything a URL cannot carry literally — spaces, '#'
+// (which would silently truncate the path into a fragment), control and
+// non-ASCII bytes, a stray '%' — is percent-encoded.
+func encodePath(p string) string {
+	const hex = "0123456789ABCDEF"
+	isHex := func(c byte) bool {
+		return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+	}
+	var b strings.Builder
+	b.Grow(len(p) + 8)
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		switch {
+		case c == '%' && i+2 < len(p) && isHex(p[i+1]) && isHex(p[i+2]):
+			b.WriteByte(c)
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			strings.IndexByte("-._~/?=&!$'()*+,;:@", c) >= 0:
+			b.WriteByte(c)
+		default:
+			b.WriteByte('%')
+			b.WriteByte(hex[c>>4])
+			b.WriteByte(hex[c&15])
+		}
+	}
+	return b.String()
 }

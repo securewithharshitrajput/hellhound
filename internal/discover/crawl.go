@@ -10,6 +10,7 @@ import (
 	"context"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/securewithharshitrajput/hellhound/internal/engine"
@@ -92,6 +93,11 @@ func Crawl(ctx context.Context, eng *engine.Engine, target string, maxDepth, max
 			if resp.Err != nil {
 				continue
 			}
+			// A dead link is not a discovery: 404/410 are followed no
+			// further and not reported.
+			if resp.Status == 404 || resp.Status == 410 {
+				continue
+			}
 			if it.depth > 0 { // never report the start page as a "finding"
 				results = append(results, CrawlResult{
 					URL:         it.u.String(),
@@ -145,21 +151,49 @@ func resolveInScope(page *url.URL, raw, host string) *url.URL {
 	if abs.Host != host {
 		return nil
 	}
+	if len(abs.Path)+len(abs.RawQuery) > maxLinkLen || endsSession(abs.Path) {
+		return nil
+	}
 	if abs.Scheme != "http" && abs.Scheme != "https" {
 		return nil
 	}
 	return abs
 }
 
-// canonicalURL is the dedupe key: scheme+host+path+query, no fragment. Query
-// is kept so distinct query-driven pages are each visited, bounded by
-// maxPages.
+// maxLinkLen bounds the path+query of a link worth following; longer ones
+// are generated junk (or an attempt to make the crawler misbehave).
+const maxLinkLen = 2048
+
+// endsSession reports whether following path would log the scanning
+// identity out — fatal for an authenticated crawl (-H "Cookie: ..."), since
+// every later request would see the logged-out site.
+func endsSession(path string) bool {
+	seg := strings.ToLower(lastSeg(path))
+	for _, w := range []string{"logout", "log-out", "log_out", "signout", "sign-out", "sign_out", "logoff", "log-off"} {
+		if strings.HasPrefix(seg, w) {
+			return true
+		}
+	}
+	return false
+}
+
+// canonicalURL is the dedupe key: scheme+host+path plus the sorted NAMES of
+// the query parameters, no fragment. Parameter values are left out so a
+// session id, cache-buster or page counter that changes on every link
+// ("/a?sid=1", "/a?sid=2", ...) is one page, not an endless supply of new
+// ones; a link with a different parameter set is still visited.
 func canonicalURL(u *url.URL) string {
 	path := u.Path
 	if path == "" {
 		path = "/" // "http://host" and "http://host/" are the same page
 	}
-	return u.Scheme + "://" + u.Host + path + "?" + u.RawQuery
+	q := u.Query()
+	names := make([]string, 0, len(q))
+	for k := range q {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return u.Scheme + "://" + u.Host + path + "?" + strings.Join(names, "&")
 }
 
 // extractLinks returns the raw href/src/action values from an HTML body,
@@ -201,7 +235,7 @@ func WordsFromCrawl(results []CrawlResult) []string {
 		}
 		for _, seg := range strings.Split(strings.Trim(u.Path, "/"), "/") {
 			seg = strings.TrimSpace(seg)
-			if seg == "" || strings.Contains(seg, ".") || seen[seg] {
+			if seg == "" || len(seg) > 64 || strings.Contains(seg, ".") || seen[seg] {
 				continue
 			}
 			seen[seg] = true

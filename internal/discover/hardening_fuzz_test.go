@@ -64,3 +64,22 @@ func FuzzTierAParsers(f *testing.F) {
 		}
 	})
 }
+
+// FuzzEncodePath: whatever a wordlist line contains, the encoded path must
+// be plain printable ASCII with no character that ends or splits a URL path.
+func FuzzEncodePath(f *testing.F) {
+	for _, s := range []string{"/admin", "/a b#c", "/%zz%", "/\xff\x00", "/ü?x=1"} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, p string) {
+		out := encodePath(p)
+		for i := 0; i < len(out); i++ {
+			if c := out[i]; c <= 0x20 || c >= 0x7f || c == '#' || c == '"' || c == '<' || c == '>' || c == '\\' {
+				t.Fatalf("encodePath(%q) = %q contains unsafe byte %#x", p, out, c)
+			}
+		}
+		if encodePath(out) != out {
+			t.Fatalf("encodePath is not idempotent for %q: %q -> %q", p, out, encodePath(out))
+		}
+	})
+}

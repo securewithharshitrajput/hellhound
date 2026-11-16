@@ -67,10 +67,10 @@ flowchart LR
 ## Install
 
 ```bash
-go install github.com/securewithharshitrajput/hellhound/cmd/hellhound@v0.6.1
+go install github.com/securewithharshitrajput/hellhound/cmd/hellhound@v0.7.0
 ```
 
-(Pin to a tagged version like `@v0.6.1` rather than `@latest` — Go's module proxy caches version lookups, and `@latest` against an untagged commit can serve a stale result until the proxy's cache naturally refreshes. A tagged release doesn't have that problem.)
+(Pin to a tagged version like `@v0.7.0` rather than `@latest` — Go's module proxy caches version lookups, and `@latest` against an untagged commit can serve a stale result until the proxy's cache naturally refreshes. A tagged release doesn't have that problem.)
 
 This drops a `hellhound` binary into `$(go env GOBIN)` (usually `~/go/bin`) — the same place `ffuf`/`katana` live. Make sure that's on your `PATH` and you're done:
 
@@ -172,9 +172,9 @@ The banner at the top is randomized per run (Metasploit-style rotating tips) and
 |---|---|---|
 | `-u` | *(required)* | Target base URL |
 | `-w` | — | Wordlist file, one word per line — merged with the built-in seed and mined words |
-| `-c` | `40` | Concurrent requests |
+| `-c` | `40` | Concurrent requests (1–1000) |
 | `-depth` | `2` | Max recursion depth (`0` = scan only the given directory) |
-| `-calibrate` | `6` | Calibration probes per directory |
+| `-calibrate` | `6` | Calibration probes per directory (minimum 2; more are sent automatically when the not-found pages disagree) |
 | `-ext` | — | Comma-separated extensions to try, e.g. `.php,.bak,.old` |
 | `-H` | — | Custom header, repeatable: `-H "Name: value"` |
 | `-k` | `false` | Skip TLS verification (self-signed dev/staging certs **only** — never on production scope) |
@@ -229,7 +229,7 @@ This isn't "it compiled, ship it." The analyzer and engine were deliberately put
 - **50,000-word stress test** against a live server — found and fixed a ~0.1% false-positive edge case in redaction ordering
 - **Goroutine leak checks** across repeated scans
 
-116 tests and fuzz targets passing (every Tier-A detector carries fingerprint, false-positive-rejection and catch-all-target regression tests, plus fuzzing of everything that parses target-controlled bodies and headers), `go vet` and `gofmt` clean, zero known crashes.
+153 tests and fuzz targets passing (every Tier-A detector carries fingerprint, false-positive-rejection and catch-all-target regression tests, plus fuzzing of everything that parses target-controlled bodies and headers), `go vet` and `gofmt` clean, zero known crashes.
 
 ```bash
 go test ./...
@@ -238,6 +238,25 @@ go test ./internal/analyze/ -fuzz FuzzSimHash -fuzztime 30s
 ```
 
 ---
+
+## Behaviour on difficult targets
+
+Hellhound is tested against a set of deliberately hostile targets, each with a known ground truth, and must report exactly the real endpoints on every one:
+
+| Target behaviour | What hellhound does |
+|---|---|
+| "Not found" pages whose content changes on every request (random recommendations, rotating tokens on a short page) | Detects that the calibration probes disagree, doubles the sample, and switches that directory to vocabulary-based filtering — with one warning, because a real page reusing the same wording can be missed |
+| Hit rate still implausible after calibration | Learns the baseline again from a larger sample and re-requests every remaining hit, keeping only those that still stand out |
+| Rate limiting (`429`) | Backs off, retries up to three times, never reports a `429` as a finding, and says how many paths were left unchecked |
+| Dropped connections | Retries a reset/closed connection once; timeouts are not retried |
+| Target under a path prefix (`-u http://host/app`) | Recurses relative to the prefix |
+| Case-insensitive servers (IIS and similar) | Detects it once and merges `/Admin`, `/ADMIN`, `/admin` into one finding and one directory |
+| Hostile wordlist entries (spaces, `#`, stray `%`, control and non-ASCII bytes) | Percent-encodes what a URL cannot carry; valid `%XX` escapes and query strings are kept |
+| Crawl traps (endless calendars, session ids in links, 70 KB links, logout links) | Dedupes on path + parameter names, skips over-long links and logout/sign-out links, never reports dead links |
+| Escape sequences in titles, headers, redirect targets or API schema names | Rendered as visible text (`\x1b[31m`) in the terminal and in JSON/CSV/SARIF; CSV cells that would be read as spreadsheet formulas are neutralised |
+| Unreachable target, bad URL, unreadable `-w`/`-vhosts` file, unwritable report path, out-of-range flag | Refused before anything is sent, with a message naming the problem and a non-zero exit code |
+
+Exit codes: `0` scan completed, `1` target unreachable or a report could not be written, `2` invalid arguments, `130` interrupted (partial results are still printed and written).
 
 ## Legal & ethics
 

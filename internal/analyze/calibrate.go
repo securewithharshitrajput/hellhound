@@ -8,6 +8,7 @@
 package analyze
 
 import (
+	"bytes"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -19,7 +20,39 @@ import (
 type Baseline struct {
 	BaseDir    string
 	Signatures []Signature // usually 1, but a target can have >1 soft-404 shape (e.g. different for /api/ vs /)
+	// dynamic holds, per status code, a token-vocabulary model of the
+	// "not found" responses. It is only built when the probes for that
+	// status do NOT share one stable shape (see Unstable).
+	dynamic map[int]*vocabModel
+	// unstable is set when same-status probes disagree in shape, even if
+	// there were too few of them to build a vocabulary model.
+	unstable bool
 }
+
+// Unstable reports whether this directory's "not found" responses differ
+// from each other beyond what shape hashing tolerates (rotating content,
+// per-request tokens on a short page, randomized recommendations). Callers
+// can use it to send more calibration probes and to warn the operator.
+func (b *Baseline) Unstable() bool {
+	return b != nil && (b.unstable || len(b.dynamic) > 0)
+}
+
+// vocabModel describes a family of dynamic "not found" responses by the
+// words they are made of rather than by their shape.
+type vocabModel struct {
+	vocab     map[string]struct{} // every token seen in any probe
+	threshold float64             // novelty at or below this is "still the not-found page"
+}
+
+const (
+	// minDynamicProbes is the fewest same-status probes needed before a
+	// vocabulary model is trusted.
+	minDynamicProbes = 3
+	// noveltyMargin is added to the highest novelty any probe showed
+	// against the others. A not-found page built from the same template
+	// and vocabulary stays under it; a real page brings its own words.
+	noveltyMargin = 0.15
+)
 
 // Signature is one observed (status, size-bucket, simhash) combination.
 //
@@ -128,6 +161,7 @@ func (c *Calibrator) Learn(baseDir string, probes []Probe) *Baseline {
 	for _, sig := range seen {
 		b.Signatures = append(b.Signatures, sig)
 	}
+	b.dynamic, b.unstable = buildDynamicModels(baseDir, probes)
 	if len(b.Signatures) == 0 {
 		// Target never responded during calibration (all errors) — treat
 		// everything as potentially interesting rather than silently
@@ -152,6 +186,12 @@ func (c *Calibrator) Classify(baseDir, path string, resp engine.Response) Verdic
 
 	if resp.Err != nil {
 		return Verdict{Interesting: false, Reason: "request error: " + resp.Err.Error(), ClusterKey: hash}
+	}
+
+	// 429 means the target refused to answer (rate limiting), still, after
+	// the engine's backoff and retry. It says nothing about the path.
+	if resp.Status == 429 {
+		return Verdict{Interesting: false, Reason: "rate limited (429) — the target did not answer for this path", ClusterKey: hash}
 	}
 
 	// Hard-404s with no baseline match are boring regardless of calibration.
@@ -196,6 +236,27 @@ func (c *Calibrator) Classify(baseDir, path string, resp engine.Response) Verdic
 		baseAdj := SimHash(sig.rawBody, sig.probeToken, sig.probeSeg, echoed, echoedSeg)
 		if Hamming(baseAdj, candCapped) <= simThreshold {
 			return Verdict{Interesting: false, Reason: fmt.Sprintf("matches soft-404 baseline after symmetric redaction (status %d, shape dist %d) — candidate word collided with template chrome", sig.Status, Hamming(baseAdj, candCapped)), ClusterKey: hash}
+		}
+	}
+
+	// Dynamic-baseline pass: when this directory's not-found responses do
+	// not share one stable shape, shape hashing cannot recognise them, and
+	// every miss would be reported. Judge by vocabulary instead: a response
+	// made almost entirely of words already seen in the not-found probes is
+	// another not-found page.
+	if m := b.dynamic[resp.Status]; m != nil {
+		toks := tokenSet(capBytes(resp.Body, maxTemplateBody), echoed, echoedSeg)
+		if len(toks) > 0 {
+			novel := 0
+			for t := range toks {
+				if _, ok := m.vocab[t]; !ok {
+					novel++
+				}
+			}
+			ratio := float64(novel) / float64(len(toks))
+			if ratio <= m.threshold {
+				return Verdict{Interesting: false, Reason: fmt.Sprintf("matches dynamic soft-404 baseline (status %d, %.0f%% new words, limit %.0f%%)", resp.Status, 100*ratio, 100*m.threshold), ClusterKey: hash}
+			}
 		}
 	}
 
@@ -351,4 +412,110 @@ func echoedPath(path string) string {
 		return path[:i]
 	}
 	return path
+}
+
+// buildDynamicModels groups probes by status and, for each status whose
+// probes do not all share one shape, builds a vocabulary model.
+func buildDynamicModels(baseDir string, probes []Probe) (map[int]*vocabModel, bool) {
+	type probeInfo struct {
+		hash uint64
+		toks map[string]struct{}
+	}
+	byStatus := map[int][]probeInfo{}
+	for _, p := range probes {
+		if p.Resp.Err != nil {
+			continue
+		}
+		probePath := joinDir(baseDir, p.Token)
+		byStatus[p.Resp.Status] = append(byStatus[p.Resp.Status], probeInfo{
+			hash: SimHash(p.Resp.Body, probePath, p.Token),
+			toks: tokenSet(capBytes(p.Resp.Body, maxTemplateBody), probePath, p.Token),
+		})
+	}
+	var out map[int]*vocabModel
+	unstable := false
+	for status, infos := range byStatus {
+		stable := true
+		for i := 1; i < len(infos) && stable; i++ {
+			if Hamming(infos[0].hash, infos[i].hash) > simThreshold {
+				stable = false
+			}
+		}
+		if stable {
+			continue
+		}
+		unstable = true
+		if len(infos) < minDynamicProbes {
+			continue // caller should send more probes and Learn again
+		}
+		// How many probes contain each token.
+		counts := map[string]int{}
+		for _, in := range infos {
+			for t := range in.toks {
+				counts[t]++
+			}
+		}
+		// Leave-one-out novelty: the share of a probe's words that no
+		// other probe has. Its maximum is how "new" a not-found page can
+		// look on this target.
+		maxNovelty := 0.0
+		for _, in := range infos {
+			if len(in.toks) == 0 {
+				continue
+			}
+			unique := 0
+			for t := range in.toks {
+				if counts[t] == 1 {
+					unique++
+				}
+			}
+			if r := float64(unique) / float64(len(in.toks)); r > maxNovelty {
+				maxNovelty = r
+			}
+		}
+		m := &vocabModel{vocab: make(map[string]struct{}, len(counts)), threshold: maxNovelty + noveltyMargin}
+		for t := range counts {
+			m.vocab[t] = struct{}{}
+		}
+		if out == nil {
+			out = map[int]*vocabModel{}
+		}
+		out[status] = m
+	}
+	return out, unstable
+}
+
+// tokenSet returns the distinct words of body after the same redaction
+// Normalize applies (volatile values and the requested path removed).
+// Tokens containing a digit are dropped: counters, ids, timestamps and
+// hashes change per request and would read as "new words" every time.
+func tokenSet(body []byte, extra ...string) map[string]struct{} {
+	norm := bytes.ToLower(Normalize(body, extra...))
+	out := map[string]struct{}{}
+	start, hasDigit := -1, false
+	flush := func(end int) {
+		if start >= 0 && !hasDigit {
+			if n := end - start; n >= 2 && n <= 24 {
+				out[string(norm[start:end])] = struct{}{}
+			}
+		}
+		start, hasDigit = -1, false
+	}
+	for i, c := range norm {
+		switch {
+		case c >= '0' && c <= '9':
+			if start < 0 {
+				start = i
+			}
+			hasDigit = true
+		case (c >= 'a' && c <= 'z') || c >= 0x80:
+			if start < 0 {
+				start = i
+			}
+		default:
+			flush(i)
+		}
+	}
+	flush(len(norm))
+	return out
 }

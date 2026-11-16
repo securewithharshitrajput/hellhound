@@ -6,12 +6,16 @@ package engine
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -139,7 +143,7 @@ func DefaultConfig() Config {
 		Timeout:            10 * time.Second,
 		FollowRedirect:     false,
 		MaxBodyBytes:       512 * 1024,
-		UserAgent:          "hellhound/0.5 (+authorized-testing)",
+		UserAgent:          "hellhound/0.7 (+authorized-testing)",
 		RetryOn429:         true,
 		InsecureSkipVerify: false,
 	}
@@ -174,6 +178,22 @@ func New(cfg Config) *Engine {
 // is still returned (usable, just without the bad proxy) so a caller can
 // choose to warn-and-continue; the CLI treats a bad -x as fatal.
 func NewErr(cfg Config) (*Engine, error) {
+	// Clamp values that would otherwise deadlock (zero workers), panic
+	// (negative channel size) or hang forever (no timeout). The CLI rejects
+	// these up front; this keeps library callers safe too.
+	def := DefaultConfig()
+	if cfg.Concurrency < 1 {
+		cfg.Concurrency = 1
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = def.Timeout
+	}
+	if cfg.MaxBodyBytes <= 0 {
+		cfg.MaxBodyBytes = def.MaxBodyBytes
+	}
+	if cfg.UserAgent == "" {
+		cfg.UserAgent = def.UserAgent
+	}
 	tr := &http.Transport{
 		MaxIdleConns:        cfg.Concurrency * 2,
 		MaxIdleConnsPerHost: cfg.Concurrency * 2,
@@ -279,8 +299,15 @@ func (e *Engine) DoAll(ctx context.Context, reqs []Request) []Response {
 	sem := make(chan struct{}, e.cfg.Concurrency)
 	var wg sync.WaitGroup
 	for i, r := range reqs {
+		// Stop launching once the caller cancels; the remaining requests
+		// report the cancellation instead of waiting for a free slot.
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			out[i] = Response{Req: r, Err: ctx.Err()}
+			continue
+		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(i int, r Request) {
 			defer wg.Done()
 			defer func() { <-sem }()
@@ -322,13 +349,45 @@ func (e *Engine) triggerBackoff(d time.Duration) {
 
 func (e *Engine) do(ctx context.Context, r Request) Response {
 	resp := e.once(ctx, r)
-	if e.cfg.RetryOn429 && (resp.Status == 429 || resp.Status == 503) {
+	// A connection that was reset or closed mid-exchange is a transport
+	// hiccup, not an answer about the path. Retry it once so one dropped
+	// connection does not become one silently missed endpoint. Timeouts
+	// are not retried: a path that hangs will hang again, and retrying
+	// would double the cost of every slow target.
+	if resp.Err != nil && ctx.Err() == nil && isDroppedConnection(resp.Err) {
+		resp = e.once(ctx, r)
+	}
+	// 429 is retried up to three times: after a pause every worker resumes
+	// at once, and that burst alone can trip the limit again, so a single
+	// retry leaves a tail of paths unchecked. 503 gets one retry — it can
+	// be a path's genuine answer, and each retry pauses the whole scan.
+	for attempt := 0; e.cfg.RetryOn429 && ctx.Err() == nil; attempt++ {
+		if !(resp.Status == 429 && attempt < 3) && !(resp.Status == 503 && attempt < 1) {
+			break
+		}
 		d := retryAfter(resp.Header, 2*time.Second)
 		e.triggerBackoff(d)
 		e.waitIfPaused(ctx)
 		resp = e.once(ctx, r)
 	}
 	return resp
+}
+
+// isDroppedConnection reports whether err is a connection that was reset,
+// refused mid-scan or closed before a full response arrived — as opposed to
+// a timeout, a TLS failure or a malformed URL.
+func isDroppedConnection(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "connection reset") || strings.Contains(msg, "server closed idle connection") ||
+		strings.Contains(msg, "unexpected EOF") || strings.HasSuffix(msg, ": EOF")
 }
 
 func (e *Engine) once(ctx context.Context, r Request) Response {

@@ -22,13 +22,13 @@ func WriteCSV(w io.Writer, r JSONReport) error {
 	writeRow := func(f JSONFinding) error {
 		return cw.Write([]string{
 			"endpoint", "", "",
-			f.URL,
+			csvCell(f.URL),
 			strconv.Itoa(f.Status),
 			strconv.Itoa(f.Length),
 			strconv.Itoa(f.Words),
 			strconv.Itoa(f.Lines),
 			strconv.Itoa(f.Depth),
-			f.Reason, "",
+			csvCell(f.Reason), "",
 		})
 	}
 	for _, c := range r.Clusters {
@@ -47,8 +47,8 @@ func WriteCSV(w io.Writer, r JSONReport) error {
 	for _, s := range r.SecurityFindings {
 		if err := cw.Write([]string{
 			"security", s.Type, s.Severity,
-			s.URL, "", "", "", "", "",
-			s.Description, s.Evidence,
+			csvCell(s.URL), "", "", "", "", "",
+			csvCell(s.Description), csvCell(s.Evidence),
 		}); err != nil {
 			return err
 		}
@@ -203,7 +203,7 @@ func WriteSARIF(w io.Writer, r JSONReport) error {
 			add(c.Representative)
 		}
 	}
-	for _, s := range r.SecurityFindings {
+	for _, s := range CleanFindings(r.SecurityFindings) {
 		msg := "[" + strings.ToUpper(s.Severity) + "] " + s.URL + " — " + s.Description
 		if s.Evidence != "" {
 			msg += " (evidence: " + s.Evidence + ")"

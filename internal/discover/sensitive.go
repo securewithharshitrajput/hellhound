@@ -338,3 +338,58 @@ func excerpt(body []byte, start, matchLen int) string {
 	}, string(body[start:end]))
 	return strings.TrimSpace(s)
 }
+
+// maxSensitiveDirs bounds how many directories besides the target root get
+// the full sensitive-file probe set, so a scan that found hundreds of
+// directories does not multiply into tens of thousands of extra requests.
+const maxSensitiveDirs = 10
+
+// ScanSensitiveAll runs ScanSensitive at the target root and in the
+// directories discovery found (an exposed .env or .git is as likely under
+// /app/ or /public/ as at the root). It returns the findings and how many
+// directories were skipped because of the maxSensitiveDirs cap.
+func ScanSensitiveAll(ctx context.Context, eng *engine.Engine, baseURL string, results []Result) ([]SecurityFinding, int) {
+	baseURL = strings.TrimRight(baseURL, "/")
+	bases := []string{baseURL}
+	seen := map[string]bool{baseURL: true}
+	skipped := 0
+	add := func(dir string) {
+		dir = strings.TrimRight(dir, "/")
+		if dir == "" || seen[dir] || !strings.HasPrefix(dir, baseURL+"/") {
+			return
+		}
+		seen[dir] = true
+		if len(bases) > maxSensitiveDirs {
+			skipped++
+			return
+		}
+		bases = append(bases, dir)
+	}
+	for _, r := range results {
+		if r.Status < 200 || r.Status >= 400 {
+			continue
+		}
+		u := r.URL
+		if i := strings.IndexAny(u, "?#"); i >= 0 {
+			u = u[:i]
+		}
+		if looksLikeDirectory(r) {
+			add(u)
+		}
+	}
+
+	var out []SecurityFinding
+	dup := map[string]bool{}
+	for _, b := range bases {
+		if ctx.Err() != nil {
+			break
+		}
+		for _, f := range ScanSensitive(ctx, eng, b) {
+			if !dup[f.URL] {
+				dup[f.URL] = true
+				out = append(out, f)
+			}
+		}
+	}
+	return out, skipped
+}

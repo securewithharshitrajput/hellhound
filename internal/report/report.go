@@ -41,9 +41,9 @@ type JSONReport struct {
 
 func toJSONFinding(r discover.Result) JSONFinding {
 	return JSONFinding{
-		URL: r.URL, Status: r.Status, Length: r.Length,
+		URL: Clean(r.URL), Status: r.Status, Length: r.Length,
 		Words: r.Words, Lines: r.Lines, Depth: r.Depth,
-		Reason: r.Verdict.Reason,
+		Reason: Clean(r.Verdict.Reason),
 	}
 }
 
@@ -69,26 +69,41 @@ func Build(target string, results []discover.Result) JSONReport {
 
 	out := JSONReport{Target: target, Total: len(results)}
 	for _, c := range clusters {
-		rep := resultByURL[c.Representative.URL]
-		jc := JSONCluster{
-			Representative: toJSONFinding(rep),
-			MemberCount:    len(c.Members),
+		// Responses arrive in whatever order the network delivers them, so
+		// "first seen" would make the report differ between identical
+		// runs. Order members by URL and let the shortest URL represent
+		// the cluster: "/admin" rather than "/admin?x=1" or "/admin.bak".
+		members := make([]string, 0, len(c.Members))
+		for _, m := range c.Members {
+			members = append(members, m.URL)
 		}
-		if len(c.Members) > 1 {
-			for _, m := range c.Members {
-				jc.Members = append(jc.Members, toJSONFinding(resultByURL[m.URL]))
+		if len(members) == 0 {
+			members = append(members, c.Representative.URL)
+		}
+		sort.Slice(members, func(i, j int) bool { return urlLess(members[i], members[j]) })
+		jc := JSONCluster{
+			Representative: toJSONFinding(resultByURL[members[0]]),
+			MemberCount:    len(members),
+		}
+		if len(members) > 1 {
+			for _, u := range members {
+				jc.Members = append(jc.Members, toJSONFinding(resultByURL[u]))
 			}
 		}
 		out.Clusters = append(out.Clusters, jc)
 	}
 	sort.SliceStable(out.Clusters, func(i, j int) bool {
-		return out.Clusters[i].MemberCount > out.Clusters[j].MemberCount
+		if out.Clusters[i].MemberCount != out.Clusters[j].MemberCount {
+			return out.Clusters[i].MemberCount > out.Clusters[j].MemberCount
+		}
+		return out.Clusters[i].Representative.URL < out.Clusters[j].Representative.URL
 	})
 	return out
 }
 
 // WriteJSON writes the report as indented JSON.
 func WriteJSON(w io.Writer, r JSONReport) error {
+	r.SecurityFindings = CleanFindings(r.SecurityFindings)
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(r)
@@ -130,6 +145,7 @@ func WriteSecuritySummary(w io.Writer, findings []discover.SecurityFinding) {
 		return sorted[i].URL < sorted[j].URL
 	})
 
+	sorted = CleanFindings(sorted)
 	fmt.Fprintf(w, "\n[security] %d finding(s):\n", len(sorted))
 	for _, f := range sorted {
 		fmt.Fprintf(w, "  [%s] %s  %s\n", severityLabel(f.Severity), f.Type, f.URL)
@@ -158,4 +174,12 @@ func severityLabel(s string) string {
 		return "INFO  "
 	}
 	return s
+}
+
+// urlLess orders URLs shortest first, then alphabetically.
+func urlLess(a, b string) bool {
+	if len(a) != len(b) {
+		return len(a) < len(b)
+	}
+	return a < b
 }
