@@ -43,6 +43,12 @@ type Options struct {
 	// that otherwise mistakes a well-mined wordlist for a blocked scan.
 	Expected map[string]bool
 
+	// Home is how the target's homepage answered before the scan (see
+	// SnapshotHome). With it, a firewall that starts blocking this client
+	// partway through is recognised and its block pages are not reported;
+	// without it that detection is off.
+	Home *HomeSnapshot
+
 	// OnProgress, if set, is called after every classified response with
 	// the directory being scanned, how many of its candidates are done, how
 	// many it has in total, and the hits so far in that directory. It is
@@ -130,6 +136,9 @@ type Discoverer struct {
 	caseInsensitive bool
 	warnedUnstable  bool
 	warnedCatchAll  bool
+	warnedDotfiles  bool
+	// blocked records that the target's firewall blocked the scan.
+	blocked bool
 	// catchAll records directories whose not-found answer is a 2xx.
 	catchAll map[string]bool
 }
@@ -341,6 +350,16 @@ func (d *Discoverer) scanDir(ctx context.Context, dir string, depth int) ([]Resu
 		}
 		return nil, fmt.Errorf("skipped: only %d of %d calibration probes got an answer, too few to tell real pages from not-found ones (last error: %v)", answered, len(probes), lastErr)
 	}
+	// Every probe got the same 403/429/503 page: either this directory
+	// really answers that way, or a firewall is refusing this client. The
+	// homepage tells them apart. Learning a block page as "not found" would
+	// make every real not-found answer look like a finding.
+	if page, ok := uniformBlockProbes(probes); ok && ctx.Err() == nil {
+		if blocked, why := d.homepageBlocked(ctx, page); blocked {
+			rate := d.noteBlocked()
+			return nil, fmt.Errorf("skipped: the target's firewall or bot protection is blocking this scan — unknown paths get one identical %d page (%d bytes) and %s, so nothing here can be tested; slowed down to %d request(s)/sec — if this repeats, wait a few minutes and re-run with e.g. -rate 3 -c 2", page.Status, page.Length, why, rate)
+		}
+	}
 	b := d.cal.Learn(dir, probes)
 	if b.CatchAll() {
 		if d.catchAll == nil {
@@ -420,6 +439,9 @@ func (d *Discoverer) scanDir(ctx context.Context, dir string, depth int) ([]Resu
 		if !v.Interesting {
 			continue
 		}
+		if !forced && isGenericReason(v.Reason) {
+			v.Reason = describeHit(path, resp.Status, resp.Header.Get("Content-Type"), resp.Length, resp.RedirectTo)
+		}
 		results = append(results, Result{
 			URL:         resp.Req.URL,
 			Status:      resp.Status,
@@ -441,8 +463,17 @@ func (d *Discoverer) scanDir(ctx context.Context, dir string, depth int) ([]Resu
 	if rateLimited > 0 {
 		d.opts.OnWarning(dir, fmt.Errorf("%d of %d requests were still rate-limited (429) after backing off, so those paths were not checked — re-run with a lower -rate or -c", rateLimited, total))
 	}
+	results = d.dropBlockPages(ctx, dir, results)
+	results = d.checkDotfiles(ctx, dir, results)
 	results = d.recalibrateIfDrifted(ctx, dir, results, total-countExpected(expectedCand, total))
 	return results, nil
+}
+
+// isGenericReason reports whether a verdict reason is one of the
+// analyzer's generic "differs from the baseline" explanations, which
+// describeHit replaces with what the response actually is.
+func isGenericReason(r string) bool {
+	return strings.Contains(r, "does not match any calibrated baseline") || strings.HasSuffix(r, ", not in baseline")
 }
 
 const (
@@ -658,6 +689,29 @@ func (d *Discoverer) reverify(ctx context.Context, dir string, results []Result,
 	for i, r := range d.eng.DoAll(ctx, reqs) {
 		probes = append(probes, analyze.Probe{Token: tokens[i], Resp: r})
 	}
+	guessed := 0
+	for _, r := range results {
+		if !r.expected {
+			guessed++
+		}
+	}
+	// The fresh probes all got one block page: the firewall is refusing
+	// this client now. Learning that page as "not found" would turn every
+	// real not-found answer into a finding (seen live: real 404s reported
+	// as 403 hits), so keep the old baseline and drop the block pages.
+	if page, ok := uniformBlockProbes(probes); ok && ctx.Err() == nil {
+		if blocked, why := d.homepageBlocked(ctx, page); blocked {
+			kept := results[:0:0]
+			for _, r := range results {
+				if !sameShape(r, page) {
+					kept = append(kept, r)
+				}
+			}
+			rate := d.noteBlocked()
+			d.opts.OnWarning(dir, fmt.Errorf("the target's firewall started blocking the scan (status %d, %d bytes; %s) — %d hit(s) that were its block page were removed and paths after the block were not really tested; slowing down to %d request(s)/sec after a %s pause", page.Status, page.Length, why, len(results)-len(kept), rate, blockPause))
+			return kept
+		}
+	}
 	d.cal.Learn(dir, probes)
 
 	again := make([]engine.Request, len(results))
@@ -675,12 +729,21 @@ func (d *Discoverer) reverify(ctx context.Context, dir string, results []Result,
 		if p == "" {
 			p = strings.TrimPrefix(urlPath(res.URL), d.basePath)
 		}
-		if v, _ := d.judge(dir, p, resp); v.Interesting {
+		if v, forced := d.judge(dir, p, resp); v.Interesting {
+			// Report what the re-check saw, not the stale first answer: a
+			// path can answer differently the second time.
+			if !forced && isGenericReason(v.Reason) {
+				v.Reason = describeHit(p, resp.Status, resp.Header.Get("Content-Type"), resp.Length, resp.RedirectTo)
+			}
 			res.Verdict = v
+			res.Status, res.Length, res.Words, res.Lines = resp.Status, resp.Length, resp.Words, resp.Lines
+			res.ContentType, res.RedirectTo = resp.Header.Get("Content-Type"), resp.RedirectTo
+			res.BodyPreview = previewOf(resp.Body, res.ContentType)
+			res.Headers = captureHeaders(resp.Header)
 			kept = append(kept, res)
 		}
 	}
-	d.opts.OnWarning(dir, fmt.Errorf("%d of %d paths still looked like hits after re-calibration, which is implausible; learned the baseline again from %d probes and re-checked each one — %d remain", len(results), total, n, len(kept)))
+	d.opts.OnWarning(dir, fmt.Errorf("%d of %d guessed paths looked like hits, which is implausible; learned the not-found answer again from %d probes and re-checked every hit — %d remain", guessed, total, n, len(kept)))
 	return kept
 }
 

@@ -94,6 +94,7 @@ func main() {
 		crawlSimilar = flag.Int("crawl-similar", 5, "follow at most this many links per URL pattern (/products/{id}, /blog/{id}...); 0 = unlimited")
 		showAssets   = flag.Bool("show-assets", false, "list every static asset (JS, CSS, fonts, images) found by -crawl instead of one summary line")
 		noThrottle   = flag.Bool("no-auto-throttle", false, "do not slow down automatically when the target starts timing out")
+		showKnown    = flag.Bool("show-known", false, "also list pages the site already publishes (sitemap, crawled links, homepage assets); by default only discoveries are listed")
 	)
 	flag.String("config", "", "config file with one \"name = value\" per line (any flag); the command line overrides it")
 	flag.String("profile", "", "preset of defaults: quick, deep or gentle; a config file and the command line override it")
@@ -129,6 +130,9 @@ func main() {
 	// -w must not silently fall back to the built-in list, and an
 	// unwritable report path must not be discovered after the scan.
 	userWords, err := readListFile("-w", *wordlistPath)
+	if err != nil && *wordlistPath != "" && os.IsNotExist(errUnwrapPath(*wordlistPath)) && strings.Contains(strings.ToLower(*wordlistPath), "seclists") {
+		err = fmt.Errorf("%v\n  SecLists is not installed at that path. Get it with:\n    git clone --depth 1 https://github.com/danielmiessler/SecLists ~/SecLists\n  then use e.g. -w ~/SecLists/Discovery/Web-Content/raft-medium-directories.txt", err)
+	}
 	if err == nil && *vhostFile != "" {
 		_, err = readListFile("-vhosts", *vhostFile)
 	}
@@ -221,9 +225,16 @@ func main() {
 	// The first interrupt winds the scan down and prints partial results.
 	// Restore default signal handling as soon as it arrives, so a second
 	// Ctrl+C always terminates the process immediately.
+	//
+	// Ctrl+C also reaches every other program in the pipeline: in
+	// "hellhound ... | tee scan.txt", tee exits at once, and the next write
+	// to stdout would kill hellhound with SIGPIPE before it wrote its
+	// -json/-csv/-sarif files. Ignoring SIGPIPE from then on turns those
+	// writes into ordinary errors, so the report files are still written.
 	go func() {
 		<-ctx.Done()
 		stop()
+		signal.Ignore(syscall.SIGPIPE)
 	}()
 	// -max-time bounds the discovery phases only. Security checks and
 	// reporting run afterwards on ctx, so a time-limited scan still ends
@@ -237,7 +248,8 @@ func main() {
 	// Fail fast on an unreachable target. Without this every phase runs
 	// against nothing and the run ends with a clean-looking "0 findings",
 	// exit 0 — indistinguishable from a real scan of a clean target.
-	if pre := eng.DoAll(ctx, []engine.Request{{Method: "GET", URL: baseURL + "/"}}); len(pre) == 1 && pre[0].Err != nil && ctx.Err() == nil {
+	pre := eng.DoAll(ctx, []engine.Request{{Method: "GET", URL: baseURL + "/"}})
+	if len(pre) == 1 && pre[0].Err != nil && ctx.Err() == nil {
 		fmt.Fprintf(os.Stderr, "hellhound: target is not reachable: %v\n", pre[0].Err)
 		fmt.Fprintln(os.Stderr, "hellhound: nothing was scanned (check the URL, scheme and port; use -k for a self-signed certificate on an authorized dev/staging target)")
 		os.Exit(1)
@@ -258,6 +270,10 @@ func main() {
 	// expected to exist; the discoverer keeps them out of its "implausibly
 	// high hit rate" alarm.
 	expected := map[string]bool{}
+	// known holds pages the site itself publishes (sitemap, crawled links).
+	// Fuzzing confirms them too, but they are not discoveries, so they are
+	// kept out of the findings list unless -show-known is set.
+	known := map[string]bool{}
 	markExpected := func(before, after []string) {
 		had := make(map[string]bool, len(before))
 		for _, w := range before {
@@ -271,10 +287,17 @@ func main() {
 	}
 	if !*noMine {
 		fmt.Fprintf(os.Stderr, "hellhound: mining robots.txt + sitemap.xml + homepage + linked JS for target-derived words...\n")
-		words = discover.BuildWordlist(scanCtx, eng, baseURL, seed)
+		var ms discover.MineStats
+		words, ms = discover.BuildWordlistStats(scanCtx, eng, baseURL, seed)
 		markExpected(seed, words)
+		for _, p := range ms.SitemapPaths {
+			known[knownKey(baseURL+p)] = true
+		}
 		if extra := len(words) - len(seed); extra > 0 {
 			fmt.Fprintf(os.Stderr, "hellhound: mined %d additional word(s) from the target itself\n", extra)
+		}
+		if len(ms.Failed) > 0 && scanCtx.Err() == nil {
+			fmt.Fprintf(os.Stderr, "hellhound: warning: could not read %s — the target may be blocking or throttling this client, so fewer words were mined and tech detection may miss the stack\n", strings.Join(ms.Failed, ", "))
 		}
 	}
 
@@ -323,6 +346,10 @@ func main() {
 		}
 	}
 
+	for _, c := range crawlResults {
+		known[knownKey(c.URL)] = true
+	}
+
 	exts := []string{""}
 	if *extStr != "" {
 		for _, e := range strings.Split(*extStr, ",") {
@@ -359,6 +386,7 @@ func main() {
 		FilterCodes:  fcSet,
 		FilterSizes:  fsSet,
 		Expected:     expected,
+		Home:         discover.SnapshotHome(pre[0]),
 		OnProgress:   prog.Update,
 		OnWarning: func(dir string, err error) {
 			prog.Println("hellhound: warning: scanning %s: %s (continuing)", report.Clean(dir), report.Clean(err.Error()))
@@ -417,7 +445,26 @@ func main() {
 		fmt.Fprintf(os.Stderr, "hellhound: slowed down %d time(s) because the target was timing out; finished at %d request(s)/sec\n", n, eng.RatePerSec())
 	}
 
-	rep := report.Build(*target, results)
+	if d.Blocked() {
+		fmt.Fprintln(os.Stderr, "hellhound: warning: the target's firewall blocked part of this scan, so the results below are INCOMPLETE — wait a while and re-run with a lower -rate (e.g. -rate 3 -c 2) to cover the rest")
+	}
+
+	listed := results
+	if !*showKnown {
+		listed = results[:0:0]
+		hidden := 0
+		for _, r := range results {
+			if isKnown(known, expected, baseURL, r) {
+				hidden++
+				continue
+			}
+			listed = append(listed, r)
+		}
+		if hidden > 0 {
+			fmt.Fprintf(os.Stderr, "hellhound: %d hit(s) are pages or assets the site already links to (sitemap, crawl, homepage) — not listed as findings; add -show-known to include them\n", hidden)
+		}
+	}
+	rep := report.Build(*target, listed)
 
 	// Tier-A security phases. Each one is independent and skippable; the
 	// combined findings land in the same report so stdout/CSV/SARIF all
@@ -487,6 +534,7 @@ func runSecurityScans(ctx context.Context, eng *engine.Engine, baseURL string, r
 
 	// Sensitive-file probes in the discovered directories (the root was
 	// probed before fuzzing).
+	fmt.Fprintf(os.Stderr, "hellhound: security: probing sensitive files in discovered directories...\n")
 	sens, skipped := discover.ScanSensitiveIn(ctx, eng, baseURL, results, false)
 	findings = append(findings, sens...)
 	if skipped > 0 {
@@ -500,6 +548,9 @@ func runSecurityScans(ctx context.Context, eng *engine.Engine, baseURL string, r
 			urls = append(urls, r.URL)
 		}
 	}
+	if ctx.Err() == nil {
+		fmt.Fprintf(os.Stderr, "hellhound: security: checking HTTP methods on %d URL(s)...\n", len(urls))
+	}
 	findings = append(findings, discover.ScanDangerousMethods(ctx, eng, urls)...)
 
 	// 5) Open-redirect classification (probes any discovered URL carrying a
@@ -507,8 +558,47 @@ func runSecurityScans(ctx context.Context, eng *engine.Engine, baseURL string, r
 	// so the extra request volume is small).
 	findings = append(findings, discover.ScanOpenRedirects(ctx, eng, urls)...)
 
+	// 6) Test/staging/backup copies of the site (/test/, /staging/, /old/).
+	findings = append(findings, discover.ScanExposedCopies(ctx, eng, baseURL, results)...)
+
 	fmt.Fprintf(os.Stderr, "hellhound: security checks done in %s — %d finding(s)\n", time.Since(start).Round(time.Millisecond), len(findings))
 	return findings
+}
+
+// knownKey normalizes a URL for the known-pages set: no trailing slash,
+// no query or fragment.
+func knownKey(rawURL string) string {
+	if i := strings.IndexAny(rawURL, "?#"); i >= 0 {
+		rawURL = rawURL[:i]
+	}
+	return strings.TrimRight(rawURL, "/")
+}
+
+// isKnown reports whether a fuzzing hit is a page the site already
+// publishes (its sitemap or a crawled link), or a static asset whose name
+// was mined from the site's own pages: confirmed, but not a discovery.
+func isKnown(known, expected map[string]bool, baseURL string, r discover.Result) bool {
+	if known[knownKey(r.URL)] {
+		return true
+	}
+	p := strings.TrimPrefix(knownKey(r.URL), baseURL)
+	if r.Status < 200 || r.Status >= 300 {
+		return false
+	}
+	return standardPublicFiles[p] || (discover.IsStaticAsset(p) && expected[strings.TrimPrefix(p, "/")])
+}
+
+// standardPublicFiles exist on most sites by convention and are meant to be
+// public; finding them is not a discovery.
+var standardPublicFiles = map[string]bool{
+	"/robots.txt": true, "/sitemap.xml": true, "/favicon.ico": true,
+	"/site.webmanifest": true, "/manifest.json": true, "/apple-touch-icon.png": true,
+}
+
+// errUnwrapPath returns the error from stat-ing path (nil if it exists).
+func errUnwrapPath(path string) error {
+	_, err := os.Stat(path)
+	return err
 }
 
 // validateFlags rejects numeric flag values that cannot produce a meaningful

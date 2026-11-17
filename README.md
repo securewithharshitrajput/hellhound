@@ -67,10 +67,10 @@ flowchart LR
 ## Install
 
 ```bash
-go install github.com/securewithharshitrajput/hellhound/cmd/hellhound@v0.8.0
+go install github.com/securewithharshitrajput/hellhound/cmd/hellhound@v0.9.0
 ```
 
-(Pin to a tagged version like `@v0.8.0` rather than `@latest` — Go's module proxy caches version lookups, and `@latest` against an untagged commit can serve a stale result until the proxy's cache naturally refreshes. A tagged release doesn't have that problem.)
+(Pin to a tagged version like `@v0.9.0` rather than `@latest` — Go's module proxy caches version lookups, and `@latest` against an untagged commit can serve a stale result until the proxy's cache naturally refreshes. A tagged release doesn't have that problem.)
 
 This drops a `hellhound` binary into `$(go env GOBIN)` (usually `~/go/bin`) — the same place `ffuf`/`katana` live. Make sure that's on your `PATH` and you're done:
 
@@ -205,6 +205,11 @@ The banner at the top is randomized per run (Metasploit-style rotating tips) and
 | `-config` | — | Config file, one `name = value` per line for any flag; the command line overrides it |
 | `-profile` | — | Preset defaults: `quick`, `deep` or `gentle`; a config file and the command line override it |
 | `-no-progress` | `false` | Do not draw the live progress line (it is only drawn on a terminal) |
+| `-max-time` | `0` | Stop discovery (mining, crawl, fuzzing) after this long, e.g. `10m`, then still run the security checks and report; `0` = no limit |
+| `-crawl-similar` | `5` | Follow at most this many links per URL pattern (`/products/{id}`, `/blog/{id}`…); `0` = unlimited |
+| `-show-assets` | `false` | List every static asset found by `-crawl` instead of one summary line |
+| `-show-known` | `false` | Also list hits that are pages the site already publishes (sitemap, crawled links, homepage assets, `robots.txt`); by default only discoveries are listed |
+| `-no-auto-throttle` | `false` | Do not slow down automatically when the target starts timing out |
 | `-version` | | Print the version and exit |
 
 ### Tier-A security findings
@@ -217,6 +222,7 @@ Hellhound classifies each endpoint it discovers against a dedicated set of secur
 | **dir-listing** | Response body matches Apache/nginx/Python-SimpleHTTPServer's directory-index fingerprint — every filename enumerable, non-linked backups exposed | MEDIUM |
 | **dangerous-methods** | `OPTIONS` on each discovered endpoint; flags any `Allow:` header advertising `PUT` / `DELETE` / `PATCH` (MEDIUM) or `TRACE` alone (LOW, XST primitive) | MEDIUM / LOW |
 | **open-redirect** | Any discovered URL whose query carries a redirect-shaped parameter (`url`, `next`, `redirect`, `redirect_uri`, `goto`, `return`, `callback`, …) is re-sent with a canary external URL; a 3xx `Location:` reflecting it is flagged | MEDIUM |
+| **exposed-copy** | A discovered `/test/`, `/staging/`, `/old/`, `/backup/`, `/dev/`… that serves a public HTML site. MEDIUM when its `<title>` matches the live homepage (a full copy of the site, usually running older code), LOW otherwise | MEDIUM / LOW |
 | **info-disclosure** | `Server`, `X-Powered-By`, `X-AspNet-Version`, `X-Rails-Version`, `X-Generator`, `X-Application-Context`, etc. — deduplicated per host so a 10,000-request scan doesn't flood with the same banner | LOW / INFO |
 
 These checks are built to stay quiet on targets that answer `200` for everything (single-page apps, WAF block pages, catch-all routers):
@@ -242,7 +248,7 @@ This isn't "it compiled, ship it." The analyzer and engine were deliberately put
 - **50,000-word stress test** against a live server — found and fixed a ~0.1% false-positive edge case in redaction ordering
 - **Goroutine leak checks** across repeated scans
 
-180 tests and fuzz targets passing (every Tier-A detector carries fingerprint, false-positive-rejection and catch-all-target regression tests, plus fuzzing of everything that parses target-controlled bodies and headers), `go vet` and `gofmt` clean, zero known crashes.
+189 tests and fuzz targets passing (every Tier-A detector carries fingerprint, false-positive-rejection and catch-all-target regression tests, plus fuzzing of everything that parses target-controlled bodies and headers), `go vet` and `gofmt` clean, zero known crashes.
 
 ```bash
 go test ./...
@@ -334,6 +340,10 @@ Hellhound is tested against a set of deliberately hostile targets, each with a k
 |---|---|
 | "Not found" pages whose content changes on every request (random recommendations, rotating tokens on a short page) | Detects that the calibration probes disagree, doubles the sample, and switches that directory to vocabulary-based filtering — with one warning, because a real page reusing the same wording can be missed |
 | Hit rate still implausible after calibration | Learns the baseline again from a larger sample and re-requests every remaining hit, keeping only those that still stand out |
+| A firewall that starts blocking the scanner partway through (Hostinger, Cloudflare, Vercel: one identical `403`/`429`/`503` page for every path) | Re-asks the homepage: if it has turned into the same page since the scan started, the scan is being blocked. The block pages are removed instead of reported, the scan slows down and pauses 30s, and the run ends with a clear "results are INCOMPLETE" warning. A site that answers `403` everywhere, homepage included, has always looked that way and is scanned normally |
+| `403` on dotfiles (`/.env`, `/.git/config`) | Requests one made-up dotfile in the same directory. If that is refused too, the server blocks every dotfile and those hits prove nothing, so they are removed; if it gets a not-found answer, the `403` is specific and reported as "very likely exists" |
+| Pages the site already publishes | Hits that are in the sitemap, were reached by the crawler, or are assets named on the homepage are confirmed but not listed as findings (`-show-known` lists them) |
+| Mining blocked (homepage, `robots.txt` or scripts refused) | Says which sources could not be read, so a thin wordlist or a missed tech stack is explained |
 | Rate limiting (`429`) | Backs off, retries up to three times, never reports a `429` as a finding, and says how many paths were left unchecked |
 | Dropped connections | Retries a reset/closed connection once; timeouts are not retried |
 | Target under a path prefix (`-u http://host/app`) | Recurses relative to the prefix |
@@ -342,6 +352,8 @@ Hellhound is tested against a set of deliberately hostile targets, each with a k
 | Crawl traps (endless calendars, session ids in links, 70 KB links, logout links) | Dedupes on path + parameter names, skips over-long links and logout/sign-out links, never reports dead links |
 | Escape sequences in titles, headers, redirect targets or API schema names | Rendered as visible text (`\x1b[31m`) in the terminal and in JSON/CSV/SARIF; CSV cells that would be read as spreadsheet formulas are neutralised |
 | Unreachable target, bad URL, unreadable `-w`/`-vhosts` file, unwritable report path, out-of-range flag | Refused before anything is sent, with a message naming the problem and a non-zero exit code |
+
+When piping the output (`hellhound ... | tee scan.txt`), use `tee -i` so Ctrl+C stops only hellhound and its partial results still reach the file; the `-json`/`-csv`/`-sarif` files are written either way.
 
 Exit codes: `0` scan completed, `1` target unreachable or a report could not be written, `2` invalid arguments, `130` interrupted (partial results are still printed and written).
 

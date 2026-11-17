@@ -21,7 +21,7 @@ import (
 
 // Version is the tool's displayed version. Bump this on meaningful
 // feature changes.
-const Version = "0.8.0"
+const Version = "0.9.0"
 
 // Tagline appears under the logo and in the no-TTY fallback line.
 const Tagline = "calibrated recon that classifies what it finds"
@@ -54,6 +54,8 @@ var tips = []string{
 	"tip: -mc 401,403 shows statuses calibration would hide; -fc and -fs hide what you don't want",
 	"tip: -crawl -render follows links that only exist after a page's JavaScript has run",
 	"tip: -profile quick|deep|gentle, or -config file, instead of retyping the same flags",
+	"tip: pages the site already links to are hidden from findings — -show-known lists them too",
+	"tip: if a firewall starts blocking the scan, hellhound drops its block pages and slows down on its own",
 }
 
 // glyphs maps each supported letter to a 5-row block-letter cell. Rows

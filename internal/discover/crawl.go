@@ -330,7 +330,10 @@ func endsSession(path string) bool {
 // ("/a?sid=1", "/a?sid=2", ...) is one page, not an endless supply of new
 // ones; a link with a different parameter set is still visited.
 func canonicalURL(u *url.URL) string {
-	path := u.Path
+	// "/about" and "/about/" are one page on practically every site (one
+	// redirects to the other), so both spellings share a key; otherwise a
+	// site linking both ways lists every page twice.
+	path := strings.TrimRight(u.Path, "/")
 	if path == "" {
 		path = "/" // "http://host" and "http://host/" are the same page
 	}

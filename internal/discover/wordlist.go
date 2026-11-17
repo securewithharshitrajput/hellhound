@@ -9,6 +9,9 @@ package discover
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net"
 	"regexp"
 	"strings"
 
@@ -43,7 +46,22 @@ const maxJSFiles = 8
 // got earlier; this phase had the identical bug and was never caught
 // until a real target surfaced it.
 func BuildWordlist(ctx context.Context, eng *engine.Engine, baseURL string, seed []string) []string {
+	words, _ := BuildWordlistStats(ctx, eng, baseURL, seed)
+	return words
+}
+
+// MineStats reports how mining went: which sources could not be read (so a
+// thin wordlist is explained rather than silent) and the page paths the
+// target's own sitemap lists (pages it already publishes, not discoveries).
+type MineStats struct {
+	Failed       []string // e.g. "homepage (403)", "robots.txt (timeout)"
+	SitemapPaths []string
+}
+
+// BuildWordlistStats is BuildWordlist plus a report of what it could read.
+func BuildWordlistStats(ctx context.Context, eng *engine.Engine, baseURL string, seed []string) ([]string, MineStats) {
 	var mined []string
+	var st MineStats
 
 	first := eng.DoAll(ctx, []engine.Request{
 		{Method: "GET", URL: baseURL + "/robots.txt"},
@@ -51,6 +69,19 @@ func BuildWordlist(ctx context.Context, eng *engine.Engine, baseURL string, seed
 		{Method: "GET", URL: baseURL + "/sitemap.xml"},
 	})
 	robots, home, sitemap := first[0], first[1], first[2]
+	// robots.txt and sitemap.xml are optional: a 404 is normal. Errors,
+	// and a homepage that does not answer 2xx/3xx, mean the target refused
+	// or failed the request and mining saw less than the site has.
+	if robots.Err != nil {
+		st.Failed = append(st.Failed, "robots.txt ("+shortErr(robots.Err)+")")
+	} else if blockStatuses[robots.Status] {
+		st.Failed = append(st.Failed, fmt.Sprintf("robots.txt (%d)", robots.Status))
+	}
+	if sitemap.Err != nil {
+		st.Failed = append(st.Failed, "sitemap.xml ("+shortErr(sitemap.Err)+")")
+	} else if blockStatuses[sitemap.Status] {
+		st.Failed = append(st.Failed, fmt.Sprintf("sitemap.xml (%d)", sitemap.Status))
+	}
 
 	// The sitemap is the target's own list of its pages: every path in it
 	// is a real one, and its segments are exactly the vocabulary this site
@@ -59,7 +90,8 @@ func BuildWordlist(ctx context.Context, eng *engine.Engine, baseURL string, seed
 	if robots.Err == nil && robots.Status == 200 {
 		robotsBody = robots.Body
 	}
-	for _, p := range sitemapPaths(ctx, eng, baseURL, sitemap, robotsBody) {
+	st.SitemapPaths = sitemapPaths(ctx, eng, baseURL, sitemap, robotsBody)
+	for _, p := range st.SitemapPaths {
 		if w := strings.Trim(p, "/"); w != "" && len(w) <= 200 {
 			mined = append(mined, w)
 		}
@@ -77,7 +109,14 @@ func BuildWordlist(ctx context.Context, eng *engine.Engine, baseURL string, seed
 	}
 
 	if home.Err != nil {
-		return wordlist.Merge(seed, mined)
+		st.Failed = append(st.Failed, "homepage ("+shortErr(home.Err)+")")
+		return wordlist.Merge(seed, mined), st
+	}
+	if home.Status >= 400 {
+		// A block or error page has no links of the site in it; mining it
+		// only adds the firewall's words.
+		st.Failed = append(st.Failed, fmt.Sprintf("homepage (%d)", home.Status))
+		return wordlist.Merge(seed, mined), st
 	}
 
 	mined = append(mined, wordlist.PathToWords(wordlist.FromJS(home.Body))...)
@@ -99,13 +138,31 @@ func BuildWordlist(ctx context.Context, eng *engine.Engine, baseURL string, seed
 			jsReqs = append(jsReqs, engine.Request{Method: "GET", URL: jsURL})
 		}
 	}
+	jsFailed := 0
 	for _, js := range eng.DoAll(ctx, jsReqs) {
 		if js.Err == nil && js.Status == 200 {
 			mined = append(mined, wordlist.PathToWords(wordlist.FromJS(js.Body))...)
+		} else {
+			jsFailed++
 		}
 	}
+	if jsFailed > 0 {
+		st.Failed = append(st.Failed, fmt.Sprintf("%d of %d linked script(s)", jsFailed, len(jsReqs)))
+	}
 
-	return wordlist.Merge(seed, mined)
+	return wordlist.Merge(seed, mined), st
+}
+
+// shortErr names a request failure in a word or two.
+func shortErr(err error) string {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return "timeout"
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return "stopped"
+	}
+	return "no answer"
 }
 
 func scriptSrcs(body []byte) []string {

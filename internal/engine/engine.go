@@ -451,6 +451,20 @@ func (e *Engine) noteTimeout() {
 		e.thrMu.Unlock()
 		return
 	}
+	next := e.halveRateLocked(now)
+	e.timeoutTimes = nil
+	e.thrMu.Unlock()
+
+	e.triggerBackoff(throttlePause)
+	if e.cfg.OnThrottle != nil {
+		e.cfg.OnThrottle(next, n)
+	}
+}
+
+// halveRateLocked halves the request rate (the configured one, or the rate
+// actually achieved since the last slowdown when none was set) and returns
+// the new rate. thrMu must be held.
+func (e *Engine) halveRateLocked(now time.Time) int {
 	current := 0
 	if l := e.rate.Load(); l != nil {
 		current = l.perSec()
@@ -466,15 +480,24 @@ func (e *Engine) noteTimeout() {
 	} else {
 		e.rate.Store(newLimiter(next))
 	}
-	e.lastThrottle, e.timeoutTimes = now, nil
+	e.lastThrottle = now
 	e.winStart, e.winSent = now, e.Sent.Load()
 	e.Throttles.Add(1)
-	e.thrMu.Unlock()
+	return next
+}
 
-	e.triggerBackoff(throttlePause)
-	if e.cfg.OnThrottle != nil {
-		e.cfg.OnThrottle(next, n)
+// SlowDown halves the request rate and pauses every worker for pause. It is
+// for callers that recognise trouble the engine cannot see on its own, such
+// as a firewall answering every path with the same block page. It returns
+// the new rate in requests per second.
+func (e *Engine) SlowDown(pause time.Duration) int {
+	e.thrMu.Lock()
+	next := e.halveRateLocked(time.Now())
+	e.thrMu.Unlock()
+	if pause > 0 {
+		e.triggerBackoff(pause)
 	}
+	return next
 }
 
 // RatePerSec returns the current request-rate limit, 0 when unlimited.
