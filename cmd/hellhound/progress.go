@@ -117,7 +117,7 @@ func formatProgress(dir string, done, total, hits, dirsDone int, rps float64, el
 	if len(dir) > 40 {
 		dir = "…" + dir[len(dir)-39:]
 	}
-	s := fmt.Sprintf("[%s] %d/%d (%.0f%%) | %.0f req/s | ETA %s | %d hit(s) | %d dir(s) done", dir, done, total, pct, rps, eta, hits, dirsDone)
+	s := fmt.Sprintf("[%s] %d/%d (%.0f%%) | %.0f req/s | ETA %s | %d hit(s) to verify | %d dir(s) done", dir, done, total, pct, rps, eta, hits, dirsDone)
 	if r := []rune(s); width > 0 && len(r) > width {
 		s = string(r[:width-1]) + "…"
 	}

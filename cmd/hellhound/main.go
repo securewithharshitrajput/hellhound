@@ -28,6 +28,8 @@ import (
 	"github.com/securewithharshitrajput/hellhound/internal/report"
 	"github.com/securewithharshitrajput/hellhound/internal/scope"
 	"github.com/securewithharshitrajput/hellhound/internal/wordlist"
+	"path"
+	"sort"
 )
 
 // headerFlag lets -H be repeated on the command line (flag.String only
@@ -88,6 +90,10 @@ func main() {
 		renderJS     = flag.Bool("render", false, "with -crawl: also render each page in a local headless Chrome/Chromium and follow links that only exist after its JavaScript ran (single-page apps)")
 		renderBin    = flag.String("render-browser", "", "path or name of the Chrome/Chromium binary for -render (default: auto-detect)")
 		showVersion  = flag.Bool("version", false, "print the version and exit")
+		maxTime      = flag.Duration("max-time", 0, "stop discovery (mining, crawl, fuzzing) after this long, e.g. 10m, then run the security checks and report; 0 = no limit")
+		crawlSimilar = flag.Int("crawl-similar", 5, "follow at most this many links per URL pattern (/products/{id}, /blog/{id}...); 0 = unlimited")
+		showAssets   = flag.Bool("show-assets", false, "list every static asset (JS, CSS, fonts, images) found by -crawl instead of one summary line")
+		noThrottle   = flag.Bool("no-auto-throttle", false, "do not slow down automatically when the target starts timing out")
 	)
 	flag.String("config", "", "config file with one \"name = value\" per line (any flag); the command line overrides it")
 	flag.String("profile", "", "preset of defaults: quick, deep or gentle; a config file and the command line override it")
@@ -157,6 +163,12 @@ func main() {
 		}
 		renderer, err = newRenderer(*renderBin, *proxyURL, *insecure, *timeout, len(headers) > 0)
 	}
+	if err == nil && *maxTime < 0 {
+		err = fmt.Errorf("-max-time must be 0 (no limit) or positive (got %s)", *maxTime)
+	}
+	if err == nil && *crawlSimilar < 0 {
+		err = fmt.Errorf("-crawl-similar must be 0 (unlimited) or more (got %d)", *crawlSimilar)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "hellhound: %v\n", err)
 		os.Exit(2)
@@ -177,11 +189,17 @@ func main() {
 	cfg.Allow = func(rawURL string) bool {
 		return hostOf(rawURL) == targetHost && sc.Allows(rawURL)
 	}
+	var prog *progress
+	cfg.AutoThrottle = !*noThrottle
+	cfg.OnThrottle = func(newRate, timeouts int) {
+		prog.Println("hellhound: warning: %d requests timed out within 15s — the target is struggling or throttling the scan; slowing down to %d request(s)/sec (disable with -no-auto-throttle)", timeouts, newRate)
+	}
 	eng, err := engine.NewErr(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "hellhound: %v\n", err)
 		os.Exit(2)
 	}
+	prog = newProgress(os.Stderr, !*noProgress, eng.Sent.Load)
 	defer eng.Close() // not load-bearing for a one-shot process (the OS reclaims everything on exit), but correct practice and free
 
 	if *proxyURL != "" {
@@ -207,6 +225,14 @@ func main() {
 		<-ctx.Done()
 		stop()
 	}()
+	// -max-time bounds the discovery phases only. Security checks and
+	// reporting run afterwards on ctx, so a time-limited scan still ends
+	// with a complete report of what it found.
+	scanCtx, cancelScan := ctx, context.CancelFunc(func() {})
+	if *maxTime > 0 {
+		scanCtx, cancelScan = context.WithTimeout(ctx, *maxTime)
+	}
+	defer cancelScan()
 
 	// Fail fast on an unreachable target. Without this every phase runs
 	// against nothing and the run ends with a clean-looking "0 findings",
@@ -228,9 +254,25 @@ func main() {
 		fmt.Fprintf(os.Stderr, "hellhound: resuming from %s — %d director(ies) already done, %d queued, %d finding(s) so far (wordlist, -ext, -depth and -calibrate are taken from the saved scan)\n",
 			*resumeFile, state.Checkpoint.DirsDone, len(state.Checkpoint.Pending), len(state.Checkpoint.Results))
 	}
+	// Words taken from the target itself (sitemap, robots.txt, links) are
+	// expected to exist; the discoverer keeps them out of its "implausibly
+	// high hit rate" alarm.
+	expected := map[string]bool{}
+	markExpected := func(before, after []string) {
+		had := make(map[string]bool, len(before))
+		for _, w := range before {
+			had[w] = true
+		}
+		for _, w := range after {
+			if !had[w] {
+				expected[w] = true
+			}
+		}
+	}
 	if !*noMine {
 		fmt.Fprintf(os.Stderr, "hellhound: mining robots.txt + sitemap.xml + homepage + linked JS for target-derived words...\n")
-		words = discover.BuildWordlist(ctx, eng, baseURL, seed)
+		words = discover.BuildWordlist(scanCtx, eng, baseURL, seed)
+		markExpected(seed, words)
 		if extra := len(words) - len(seed); extra > 0 {
 			fmt.Fprintf(os.Stderr, "hellhound: mined %d additional word(s) from the target itself\n", extra)
 		}
@@ -240,8 +282,8 @@ func main() {
 	// then zero further cost — the detected stacks' curated path lists just
 	// merge into the wordlist the main fuzz loop will use.
 	var detectedTechs []discover.Tech
-	if ctx.Err() == nil && !*noTechMine {
-		detectedTechs = discover.DetectTech(ctx, eng, baseURL)
+	if scanCtx.Err() == nil && !*noTechMine {
+		detectedTechs = discover.DetectTech(scanCtx, eng, baseURL)
 		if len(detectedTechs) > 0 {
 			names := make([]string, len(detectedTechs))
 			for i, t := range detectedTechs {
@@ -268,11 +310,13 @@ func main() {
 	if state != nil {
 		crawlResults = state.Crawl
 	}
-	if ctx.Err() == nil && *crawl {
-		crawlResults = runCrawl(ctx, eng, baseURL, *crawlDepth, *crawlMax, renderer)
+	if scanCtx.Err() == nil && *crawl {
+		crawlResults = runCrawl(scanCtx, eng, baseURL, *crawlDepth, *crawlMax, *crawlSimilar, *showAssets, renderer)
 		if cw := discover.WordsFromCrawl(crawlResults); len(cw) > 0 {
 			before := len(words)
+			prev := words
 			words = wordlist.Merge(words, cw)
+			markExpected(prev, words)
 			if added := len(words) - before; added > 0 {
 				fmt.Fprintf(os.Stderr, "hellhound: crawl contributed %d new fuzz word(s)\n", added)
 			}
@@ -297,7 +341,14 @@ func main() {
 		exts = state.Extensions
 	}
 
-	prog := newProgress(os.Stderr, !*noProgress, eng.Sent.Load)
+	// The root sensitive-file probes run before fuzzing: they are the most
+	// valuable checks, cost about sixty requests, and must not be lost if
+	// the long fuzzing phase is interrupted.
+	var rootSens []discover.SecurityFinding
+	if !*noSecurity && scanCtx.Err() == nil {
+		rootSens = discover.ScanSensitive(scanCtx, eng, baseURL)
+	}
+
 	opts := discover.Options{
 		BaseURL:      baseURL,
 		Wordlist:     words,
@@ -307,6 +358,7 @@ func main() {
 		MatchCodes:   mcSet,
 		FilterCodes:  fcSet,
 		FilterSizes:  fsSet,
+		Expected:     expected,
 		OnProgress:   prog.Update,
 		OnWarning: func(dir string, err error) {
 			prog.Println("hellhound: warning: scanning %s: %s (continuing)", report.Clean(dir), report.Clean(err.Error()))
@@ -333,15 +385,21 @@ func main() {
 		*target, len(words), len(exts), *depth, *concurrency)
 
 	start := time.Now()
-	results, err := d.Run(ctx, "/")
+	results, err := d.Run(scanCtx, "/")
 	prog.Clear()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "hellhound: error: %v\n", err)
 		os.Exit(1)
 	}
-	if ctx.Err() != nil {
-		fmt.Fprintf(os.Stderr, "hellhound: interrupted after %s, sent %d requests — showing partial results below\n",
-			time.Since(start).Round(time.Millisecond), eng.Sent.Load())
+	interrupted := ctx.Err() != nil
+	timedOut := !interrupted && scanCtx.Err() != nil
+	if interrupted || timedOut {
+		why := "interrupted"
+		if timedOut {
+			why = fmt.Sprintf("reached -max-time %s", *maxTime)
+		}
+		fmt.Fprintf(os.Stderr, "hellhound: %s after %s, sent %d requests — showing partial results below\n",
+			why, time.Since(start).Round(time.Millisecond), eng.Sent.Load())
 		if *resumeFile != "" && !stateFailed {
 			fmt.Fprintf(os.Stderr, "hellhound: progress is saved in %s — run the same command again to continue from the last completed directory\n", *resumeFile)
 		} else if *resumeFile == "" {
@@ -355,6 +413,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "hellhound: done in %s, sent %d requests (%d backoff pauses)\n\n",
 			time.Since(start).Round(time.Millisecond), eng.Sent.Load(), eng.Backoffs.Load())
 	}
+	if n := eng.Throttles.Load(); n > 0 {
+		fmt.Fprintf(os.Stderr, "hellhound: slowed down %d time(s) because the target was timing out; finished at %d request(s)/sec\n", n, eng.RatePerSec())
+	}
 
 	rep := report.Build(*target, results)
 
@@ -366,10 +427,10 @@ func main() {
 	// Both fuzz-discovered AND crawl-discovered URLs are classified — a page
 	// reached only by following a link still deserves open-redirect/method
 	// checks and still leaks headers worth capturing.
-	if !*noSecurity && ctx.Err() == nil {
+	if !*noSecurity {
 		allResults := append([]discover.Result{}, results...)
 		allResults = append(allResults, discover.AsResults(crawlResults)...)
-		rep.SecurityFindings = report.CleanFindings(runSecurityScans(ctx, eng, baseURL, allResults))
+		rep.SecurityFindings = report.CleanFindings(runSecurityScans(ctx, eng, baseURL, allResults, rootSens, interrupted))
 	}
 
 	report.WriteSummary(os.Stdout, rep)
@@ -389,7 +450,7 @@ func main() {
 	if n := eng.Blocked.Load(); n > 0 {
 		fmt.Fprintf(os.Stderr, "hellhound: %d request(s) were not sent because they fell outside the allowed scope\n", n)
 	}
-	if ctx.Err() != nil {
+	if interrupted {
 		// Partial results were printed and written, but the scan did not
 		// finish: exit like any interrupted program so scripts and CI do
 		// not mistake it for a completed run.
@@ -400,24 +461,37 @@ func main() {
 // runSecurityScans runs every Tier-A detector concurrently and merges the
 // findings. Order of lines in stderr is not critical; findings land in the
 // returned slice with their severities intact so the reporter can sort.
-func runSecurityScans(ctx context.Context, eng *engine.Engine, baseURL string, results []discover.Result) []discover.SecurityFinding {
+//
+// rootSens are the sensitive-file findings at the root, probed before
+// fuzzing. When passiveOnly is set (the user interrupted the scan), no new
+// requests are sent: only the checks that work on what was already
+// captured run, so Ctrl+C still yields a security section without the tool
+// continuing to touch a target the user asked it to stop on.
+func runSecurityScans(ctx context.Context, eng *engine.Engine, baseURL string, results []discover.Result, rootSens []discover.SecurityFinding, passiveOnly bool) []discover.SecurityFinding {
 	start := time.Now()
-	fmt.Fprintf(os.Stderr, "\nhellhound: running Tier-A security checks (sensitive files, dir listings, dangerous methods, open-redirect, info-disclosure)...\n")
+	if passiveOnly {
+		fmt.Fprintf(os.Stderr, "\nhellhound: interrupted — running only the security checks that need no further requests (dir listings, info-disclosure headers); sensitive files were checked at the root before fuzzing\n")
+	} else {
+		fmt.Fprintf(os.Stderr, "\nhellhound: running Tier-A security checks (sensitive files, dir listings, dangerous methods, open-redirect, info-disclosure)...\n")
+	}
 
-	var findings []discover.SecurityFinding
+	findings := append([]discover.SecurityFinding{}, rootSens...)
 
-	// 1) Sensitive file probes (dedicated path list, concurrent batch).
-	sens, skipped := discover.ScanSensitiveAll(ctx, eng, baseURL, results)
+	// Dir-listing and info-disclosure use already-captured bodies/headers.
+	findings = append(findings, discover.ClassifyDirListings(results)...)
+	findings = append(findings, discover.CaptureInfoDisclosure(results)...)
+	if passiveOnly {
+		fmt.Fprintf(os.Stderr, "hellhound: security checks done in %s — %d finding(s)\n", time.Since(start).Round(time.Millisecond), len(findings))
+		return findings
+	}
+
+	// Sensitive-file probes in the discovered directories (the root was
+	// probed before fuzzing).
+	sens, skipped := discover.ScanSensitiveIn(ctx, eng, baseURL, results, false)
 	findings = append(findings, sens...)
 	if skipped > 0 {
 		fmt.Fprintf(os.Stderr, "hellhound: sensitive-file probes ran at the root and the first 10 discovered directories; %d more directories were not probed\n", skipped)
 	}
-
-	// 2) Dir-listing classification (zero extra requests, uses already-captured bodies).
-	findings = append(findings, discover.ClassifyDirListings(results)...)
-
-	// 3) Info-disclosure header capture (zero extra requests, uses already-captured headers).
-	findings = append(findings, discover.CaptureInfoDisclosure(results)...)
 
 	// 4) Dangerous HTTP methods (one OPTIONS per unique discovered URL).
 	urls := make([]string, 0, len(results))
@@ -689,14 +763,17 @@ func runVHostScan(ctx context.Context, eng *engine.Engine, baseURL, vhostFile st
 // runCrawl follows real links from the target to surface pages no wordlist
 // could guess — the one job a pure fuzzer structurally can't do, and the
 // gap this closes versus katana.
-func runCrawl(ctx context.Context, eng *engine.Engine, baseURL string, depth, maxPages int, render discover.Renderer) []discover.CrawlResult {
+func runCrawl(ctx context.Context, eng *engine.Engine, baseURL string, depth, maxPages, maxSimilar int, showAssets bool, render discover.Renderer) []discover.CrawlResult {
 	start := time.Now()
 	fmt.Fprintf(os.Stderr, "\nhellhound: crawling %s for linked pages (max depth %d, max %d pages)...\n", baseURL, depth, maxPages)
 	renderErrs := 0
-	results := discover.CrawlWith(ctx, eng, baseURL, depth, maxPages, render, func(pageURL string, err error) {
-		if renderErrs++; renderErrs <= 3 {
-			fmt.Fprintf(os.Stderr, "hellhound: warning: could not render %s: %s\n", report.Clean(pageURL), report.Clean(err.Error()))
-		}
+	results, stats := discover.CrawlOpts(ctx, eng, baseURL, discover.CrawlConfig{
+		MaxDepth: depth, MaxPages: maxPages, Render: render, MaxSimilar: maxSimilar,
+		OnRenderError: func(pageURL string, err error) {
+			if renderErrs++; renderErrs <= 3 {
+				fmt.Fprintf(os.Stderr, "hellhound: warning: could not render %s: %s\n", report.Clean(pageURL), report.Clean(err.Error()))
+			}
+		},
 	})
 	if renderErrs > 3 {
 		fmt.Fprintf(os.Stderr, "hellhound: warning: %d more page(s) could not be rendered\n", renderErrs-3)
@@ -704,13 +781,68 @@ func runCrawl(ctx context.Context, eng *engine.Engine, baseURL string, depth, ma
 	if len(results) == 0 {
 		fmt.Println("\n[crawl] no additional linked pages found")
 	} else {
-		fmt.Printf("\n[crawl] %d linked page(s) found by following links:\n", len(results))
+		var pages []discover.CrawlResult
+		assets := map[string]int{}
+		nAssets := 0
 		for _, r := range results {
+			if kind := assetKind(r.URL); kind != "" && !showAssets {
+				assets[kind]++
+				nAssets++
+				continue
+			}
+			pages = append(pages, r)
+		}
+		fmt.Printf("\n[crawl] %d linked page(s) found by following links:\n", len(pages))
+		for _, r := range pages {
 			fmt.Printf("    [%d] (depth %d) %s\n", r.Status, r.Depth, report.Clean(r.URL))
+		}
+		if nAssets > 0 {
+			kinds := make([]string, 0, len(assets))
+			for k := range assets {
+				kinds = append(kinds, k)
+			}
+			sort.Strings(kinds)
+			parts := make([]string, len(kinds))
+			for i, k := range kinds {
+				parts[i] = fmt.Sprintf("%s %d", k, assets[k])
+			}
+			fmt.Printf("    + %d static asset(s) not listed (%s) — add -show-assets to list them\n", nAssets, strings.Join(parts, ", "))
+		}
+		if len(stats.Capped) > 0 {
+			pats := make([]string, 0, len(stats.Capped))
+			for p := range stats.Capped {
+				pats = append(pats, p)
+			}
+			sort.Strings(pats)
+			for _, p := range pats {
+				fmt.Printf("    + %d more link(s) like %s not followed (limit %d per pattern; raise -crawl-similar to follow them)\n", stats.Capped[p], report.Clean(p), maxSimilar)
+			}
 		}
 	}
 	fmt.Fprintf(os.Stderr, "hellhound: crawl done in %s\n", time.Since(start).Round(time.Millisecond))
 	return results
+}
+
+// assetKind classifies a static asset URL by extension ("" for pages).
+func assetKind(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	ext := strings.ToLower(path.Ext(u.Path))
+	switch ext {
+	case ".js", ".mjs", ".map":
+		return "js"
+	case ".css":
+		return "css"
+	case ".woff", ".woff2", ".ttf", ".otf", ".eot":
+		return "font"
+	case ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".avif", ".bmp":
+		return "image"
+	case ".webmanifest", ".mp4", ".webm", ".mp3", ".wav":
+		return "media/other"
+	}
+	return ""
 }
 
 func loadWordlistFile(path string) []string {

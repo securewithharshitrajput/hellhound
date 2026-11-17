@@ -349,6 +349,12 @@ const maxSensitiveDirs = 10
 // /app/ or /public/ as at the root). It returns the findings and how many
 // directories were skipped because of the maxSensitiveDirs cap.
 func ScanSensitiveAll(ctx context.Context, eng *engine.Engine, baseURL string, results []Result) ([]SecurityFinding, int) {
+	return ScanSensitiveIn(ctx, eng, baseURL, results, true)
+}
+
+// ScanSensitiveIn is ScanSensitiveAll with the root optional, for callers
+// that already probed the root earlier in the run.
+func ScanSensitiveIn(ctx context.Context, eng *engine.Engine, baseURL string, results []Result, includeRoot bool) ([]SecurityFinding, int) {
 	baseURL = strings.TrimRight(baseURL, "/")
 	bases := []string{baseURL}
 	seen := map[string]bool{baseURL: true}
@@ -378,6 +384,9 @@ func ScanSensitiveAll(ctx context.Context, eng *engine.Engine, baseURL string, r
 		}
 	}
 
+	if !includeRoot {
+		bases = bases[1:]
+	}
 	var out []SecurityFinding
 	dup := map[string]bool{}
 	for _, b := range bases {

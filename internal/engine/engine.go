@@ -35,6 +35,20 @@ func newLimiter(ratePerSec int) *limiter {
 	return &limiter{interval: time.Second / time.Duration(ratePerSec)}
 }
 
+// setRate changes the limit; it applies to the next reservation.
+func (l *limiter) setRate(ratePerSec int) {
+	l.mu.Lock()
+	l.interval = time.Second / time.Duration(ratePerSec)
+	l.mu.Unlock()
+}
+
+// perSec returns the current limit in requests per second.
+func (l *limiter) perSec() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return int(time.Second / l.interval)
+}
+
 // wait blocks until this caller's reserved slot, or until ctx is done.
 func (l *limiter) wait(ctx context.Context) {
 	l.mu.Lock()
@@ -128,6 +142,13 @@ type Config struct {
 	// no proxy. Proxying HTTPS through Burp usually also needs
 	// InsecureSkipVerify (-k), since Burp presents its own CA.
 	ProxyURL string
+	// AutoThrottle halves the request rate (and pauses briefly) whenever
+	// requests start timing out in bursts — the sign of a target that is
+	// struggling or quietly throttling the scan. The rate never goes back
+	// up during the run, and never drops below 1 request per second.
+	AutoThrottle bool
+	// OnThrottle, if set, is told each time AutoThrottle slows down.
+	OnThrottle func(newRatePerSec, timeouts int)
 	// RatePerSec caps the number of requests STARTED per second across all
 	// workers (0 = unlimited, bounded only by Concurrency). A real
 	// requests/sec ceiling, separate from concurrency: it's what keeps a
@@ -153,6 +174,7 @@ func DefaultConfig() Config {
 		UserAgent:          "hellhound/0.8 (+authorized-testing)",
 		RetryOn429:         true,
 		InsecureSkipVerify: false,
+		AutoThrottle:       true,
 	}
 }
 
@@ -164,9 +186,18 @@ type Engine struct {
 	// pause gates all workers during backoff. When closed, work proceeds.
 	pauseMu sync.RWMutex
 	paused  chan struct{}
-	// rate gates request STARTS to cfg.RatePerSec across all workers; nil
-	// when unlimited.
-	rate *limiter
+	// rate gates request STARTS across all workers; nil when unlimited.
+	// Swapped atomically because auto-throttling can install one mid-scan.
+	rate atomic.Pointer[limiter]
+
+	// Auto-throttle state.
+	thrMu        sync.Mutex
+	timeoutTimes []time.Time
+	lastThrottle time.Time
+	winStart     time.Time
+	winSent      int64
+	// Throttles counts how many times auto-throttling slowed the scan.
+	Throttles atomic.Int64
 
 	Sent     atomic.Int64
 	Backoffs atomic.Int64
@@ -239,8 +270,9 @@ func NewErr(cfg Config) (*Engine, error) {
 		},
 	}
 	if cfg.RatePerSec > 0 {
-		e.rate = newLimiter(cfg.RatePerSec)
+		e.rate.Store(newLimiter(cfg.RatePerSec))
 	}
+	e.winStart = time.Now()
 	ready := make(chan struct{})
 	close(ready)
 	e.paused = ready
@@ -370,6 +402,9 @@ func (e *Engine) do(ctx context.Context, r Request) Response {
 	if resp.Err != nil && ctx.Err() == nil && isDroppedConnection(resp.Err) {
 		resp = e.once(ctx, r)
 	}
+	if resp.Err != nil && ctx.Err() == nil && e.cfg.AutoThrottle && isTimeout(resp.Err) {
+		e.noteTimeout()
+	}
 	// 429 is retried up to three times: after a pause every worker resumes
 	// at once, and that burst alone can trip the limit again, so a single
 	// retry leaves a tail of paths unchecked. 503 gets one retry — it can
@@ -384,6 +419,70 @@ func (e *Engine) do(ctx context.Context, r Request) Response {
 		resp = e.once(ctx, r)
 	}
 	return resp
+}
+
+const (
+	throttleWindow   = 15 * time.Second // timeouts are counted over this window
+	throttleTimeouts = 5                // this many in the window triggers a slowdown
+	throttlePause    = 5 * time.Second  // all workers pause this long on a slowdown
+)
+
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// noteTimeout records a request timeout and, when they come in a burst,
+// halves the request rate and pauses every worker briefly. The rate it
+// halves is the configured one, or — when none was set — the rate the scan
+// has actually been achieving since the last slowdown.
+func (e *Engine) noteTimeout() {
+	e.thrMu.Lock()
+	now := time.Now()
+	keep := e.timeoutTimes[:0]
+	for _, t := range e.timeoutTimes {
+		if now.Sub(t) <= throttleWindow {
+			keep = append(keep, t)
+		}
+	}
+	e.timeoutTimes = append(keep, now)
+	n := len(e.timeoutTimes)
+	if n < throttleTimeouts || now.Sub(e.lastThrottle) < throttleWindow {
+		e.thrMu.Unlock()
+		return
+	}
+	current := 0
+	if l := e.rate.Load(); l != nil {
+		current = l.perSec()
+	} else if el := now.Sub(e.winStart).Seconds(); el > 0 {
+		current = int(float64(e.Sent.Load()-e.winSent) / el)
+	}
+	next := current / 2
+	if next < 1 {
+		next = 1
+	}
+	if l := e.rate.Load(); l != nil {
+		l.setRate(next)
+	} else {
+		e.rate.Store(newLimiter(next))
+	}
+	e.lastThrottle, e.timeoutTimes = now, nil
+	e.winStart, e.winSent = now, e.Sent.Load()
+	e.Throttles.Add(1)
+	e.thrMu.Unlock()
+
+	e.triggerBackoff(throttlePause)
+	if e.cfg.OnThrottle != nil {
+		e.cfg.OnThrottle(next, n)
+	}
+}
+
+// RatePerSec returns the current request-rate limit, 0 when unlimited.
+func (e *Engine) RatePerSec() int {
+	if l := e.rate.Load(); l != nil {
+		return l.perSec()
+	}
+	return 0
 }
 
 // isDroppedConnection reports whether err is a connection that was reset,
@@ -430,8 +529,8 @@ func (e *Engine) once(ctx context.Context, r Request) Response {
 	// inside once() rather than do() — so a post-backoff retry also counts
 	// against the ceiling, and a request held by the limiter isn't counted
 	// as Sent until it truly fires.
-	if e.rate != nil {
-		e.rate.wait(ctx)
+	if l := e.rate.Load(); l != nil {
+		l.wait(ctx)
 		if ctx.Err() != nil {
 			return Response{Req: r, Err: ctx.Err()}
 		}

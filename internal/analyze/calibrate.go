@@ -37,6 +37,27 @@ func (b *Baseline) Unstable() bool {
 	return b != nil && (b.unstable || len(b.dynamic) > 0)
 }
 
+// CatchAll reports whether this directory answers paths that cannot exist
+// with a success status (2xx) — typical of single-page apps and catch-all
+// routers. Under such a directory every page looks like a "directory", so
+// callers should not recurse on content type alone.
+func (b *Baseline) CatchAll() bool {
+	if b == nil {
+		return false
+	}
+	for _, sig := range b.Signatures {
+		if sig.Status >= 200 && sig.Status < 300 {
+			return true
+		}
+	}
+	for st := range b.dynamic {
+		if st >= 200 && st < 300 {
+			return true
+		}
+	}
+	return false
+}
+
 // vocabModel describes a family of dynamic "not found" responses by the
 // words they are made of rather than by their shape.
 type vocabModel struct {

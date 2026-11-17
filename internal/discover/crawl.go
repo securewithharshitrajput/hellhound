@@ -8,6 +8,7 @@ package discover
 
 import (
 	"context"
+	"html"
 	"net/url"
 	"regexp"
 	"sort"
@@ -76,9 +77,43 @@ const maxRenderParallel = 3
 // renderer only contributes links. onRenderError, if non-nil, receives
 // render failures (they never stop the crawl).
 func CrawlWith(ctx context.Context, eng *engine.Engine, target string, maxDepth, maxPages int, render Renderer, onRenderError ...func(pageURL string, err error)) []CrawlResult {
+	cfg := CrawlConfig{MaxDepth: maxDepth, MaxPages: maxPages, Render: render}
+	if len(onRenderError) > 0 {
+		cfg.OnRenderError = onRenderError[0]
+	}
+	results, _ := CrawlOpts(ctx, eng, target, cfg)
+	return results
+}
+
+// CrawlConfig configures CrawlOpts.
+type CrawlConfig struct {
+	MaxDepth, MaxPages int
+	Render             Renderer
+	OnRenderError      func(pageURL string, err error)
+	// MaxSimilar caps how many links sharing one URL pattern are followed
+	// (0 = unlimited). A pattern replaces id-like path segments — long hex
+	// strings, numbers, UUIDs — with {id} and ignores query values, so
+	// "/products/6aec5b93a3abcba16ec33454" and every other product page are
+	// one pattern. Following five of them shows the page; following all of
+	// them only repeats it (and, with -render, starts a browser for each).
+	MaxSimilar int
+}
+
+// CrawlStats reports what the crawl deliberately left out.
+type CrawlStats struct {
+	// Capped maps a URL pattern to the number of links matching it that
+	// were not followed because of MaxSimilar.
+	Capped map[string]int
+}
+
+// CrawlOpts is the full-featured crawl; Crawl and CrawlWith wrap it.
+func CrawlOpts(ctx context.Context, eng *engine.Engine, target string, cfg CrawlConfig) ([]CrawlResult, CrawlStats) {
+	maxDepth, maxPages, render := cfg.MaxDepth, cfg.MaxPages, cfg.Render
+	stats := CrawlStats{}
+	perPattern := map[string]int{}
 	base, err := url.Parse(target)
 	if err != nil || base.Host == "" {
-		return nil
+		return nil, stats
 	}
 	if maxDepth < 1 {
 		maxDepth = 1
@@ -123,8 +158,8 @@ func CrawlWith(ctx context.Context, eng *engine.Engine, target string, maxDepth,
 					defer func() { <-sem }()
 					dom, err := render(ctx, pageURL)
 					if err != nil {
-						if len(onRenderError) > 0 && onRenderError[0] != nil && ctx.Err() == nil {
-							onRenderError[0](pageURL, err)
+						if cfg.OnRenderError != nil && ctx.Err() == nil {
+							cfg.OnRenderError(pageURL, err)
 						}
 						return
 					}
@@ -176,12 +211,77 @@ func CrawlWith(ctx context.Context, eng *engine.Engine, target string, maxDepth,
 					continue
 				}
 				seen[key] = true
+				if cfg.MaxSimilar > 0 {
+					pat := URLPattern(abs)
+					if perPattern[pat] >= cfg.MaxSimilar {
+						if stats.Capped == nil {
+							stats.Capped = map[string]int{}
+						}
+						stats.Capped[pat]++
+						continue
+					}
+					perPattern[pat]++
+				}
 				next = append(next, item{u: abs, depth: it.depth + 1})
 			}
 		}
 		frontier = next
 	}
-	return results
+	return results, stats
+}
+
+// URLPattern returns the path of u with id-like segments replaced by {id},
+// followed by the sorted names of its query parameters.
+func URLPattern(u *url.URL) string {
+	segs := strings.Split(u.Path, "/")
+	for i, sg := range segs {
+		if isIDSegment(sg) {
+			segs[i] = "{id}"
+		}
+	}
+	p := strings.Join(segs, "/")
+	if p == "" {
+		p = "/"
+	}
+	q := u.Query()
+	if len(q) == 0 {
+		return p
+	}
+	names := make([]string, 0, len(q))
+	for k := range q {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return p + "?" + strings.Join(names, "&")
+}
+
+// isIDSegment reports whether a path segment looks like an identifier
+// rather than a word: all digits, a UUID, or a hex string of 8+ characters
+// (MongoDB ObjectIDs, hashes).
+func isIDSegment(s string) bool {
+	if s == "" {
+		return false
+	}
+	digits, hex := true, len(s) >= 8
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		isD := c >= '0' && c <= '9'
+		isH := isD || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+		if !isD {
+			digits = false
+		}
+		if !isH {
+			hex = false
+		}
+	}
+	if digits || hex {
+		return true
+	}
+	// 8-4-4-4-12 UUID
+	if len(s) == 36 && s[8] == '-' && s[13] == '-' && s[18] == '-' && s[23] == '-' {
+		return isIDSegment(strings.ReplaceAll(s, "-", ""))
+	}
+	return false
 }
 
 // resolveInScope resolves a raw href/src value against the page it was
@@ -249,7 +349,10 @@ func extractLinks(body []byte) []string {
 	matches := linkAttrRe.FindAllSubmatch(body, -1)
 	out := make([]string, 0, len(matches))
 	for _, m := range matches {
-		s := strings.TrimSpace(string(m[1]))
+		// Attribute values are HTML: "&amp;" in an href means "&". Left
+		// encoded, a link like "/img?url=a&amp;w=64" is requested with a
+		// mangled query and the server rightly answers 400.
+		s := strings.TrimSpace(html.UnescapeString(string(m[1])))
 		if s == "" {
 			continue
 		}

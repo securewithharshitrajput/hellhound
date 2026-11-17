@@ -37,6 +37,12 @@ type Options struct {
 	FilterCodes map[int]bool
 	FilterSizes map[int]bool
 
+	// Expected lists wordlist entries taken from the target itself (its
+	// sitemap, robots.txt, crawled links). They are SUPPOSED to exist, so
+	// their hits do not count toward the "implausibly high hit rate" check
+	// that otherwise mistakes a well-mined wordlist for a blocked scan.
+	Expected map[string]bool
+
 	// OnProgress, if set, is called after every classified response with
 	// the directory being scanned, how many of its candidates are done, how
 	// many it has in total, and the hits so far in that directory. It is
@@ -91,6 +97,8 @@ type Result struct {
 	// forced marks a result reported only because of a MatchCodes override;
 	// the hit-rate safety nets neither count nor remove it.
 	forced bool
+	// expected marks a hit for a word taken from the target itself.
+	expected bool
 }
 
 const resultBodyPreviewCap = 8 * 1024
@@ -121,6 +129,9 @@ type Discoverer struct {
 	caseTested      bool
 	caseInsensitive bool
 	warnedUnstable  bool
+	warnedCatchAll  bool
+	// catchAll records directories whose not-found answer is a 2xx.
+	catchAll map[string]bool
 }
 
 func New(eng *engine.Engine, opts Options) *Discoverer {
@@ -194,6 +205,9 @@ func (d *Discoverer) Run(ctx context.Context, baseDir string) ([]Result, error) 
 		var recurse []string
 		if depth < d.opts.MaxDepth {
 			recurse = prioritizeRecursion(results)
+			if d.catchAll[dir] {
+				recurse = d.dropRoutes(ctx, dir, recurse)
+			}
 		}
 		for _, next := range recurse {
 			// Result URLs include the target's own base path; directories
@@ -297,10 +311,44 @@ func (d *Discoverer) scanDir(ctx context.Context, dir string, depth int) ([]Resu
 	// URL missing its scheme produced a confident "0 findings, exit 0"
 	// with zero indication anything was wrong. Surface it loudly instead
 	// of letting a misconfigured run masquerade as a clean result.
-	if len(probes) > 0 && failed == len(probes) {
-		d.opts.OnWarning(dir, fmt.Errorf("all %d calibration probes failed — target may be unreachable, the URL may be malformed, or TLS verification is failing (use -k to skip it, only for authorized dev/staging testing): %w", failed, lastErr))
+	// Probes that failed (timeouts on a struggling target, mostly) get one
+	// more chance; a directory is only scanned when enough of them got a
+	// real answer to learn what "not found" looks like here.
+	if failed > 0 && ctx.Err() == nil {
+		var retry []engine.Request
+		var idx []int
+		for i, p := range probes {
+			if p.Resp.Err != nil {
+				retry = append(retry, probeReqs[i])
+				idx = append(idx, i)
+			}
+		}
+		for j, r := range d.eng.DoAll(ctx, retry) {
+			probes[idx[j]].Resp = r
+			if r.Err == nil {
+				failed--
+			} else {
+				lastErr = r.Err
+			}
+		}
 	}
-	if b := d.cal.Learn(dir, probes); b.Unstable() && ctx.Err() == nil {
+	if answered := len(probes) - failed; answered < minAnswered && len(probes) > 0 {
+		if ctx.Err() != nil {
+			return nil, nil
+		}
+		if answered == 0 {
+			return nil, fmt.Errorf("skipped: all %d calibration probes failed, so nothing here could be verified — target may be unreachable or too slow (raise -timeout, lower -c/-rate), the URL may be malformed, or TLS verification is failing (use -k only for authorized dev/staging testing): %w", len(probes), lastErr)
+		}
+		return nil, fmt.Errorf("skipped: only %d of %d calibration probes got an answer, too few to tell real pages from not-found ones (last error: %v)", answered, len(probes), lastErr)
+	}
+	b := d.cal.Learn(dir, probes)
+	if b.CatchAll() {
+		if d.catchAll == nil {
+			d.catchAll = map[string]bool{}
+		}
+		d.catchAll[dir] = true
+	}
+	if b.Unstable() && ctx.Err() == nil {
 		// The not-found responses differ from one another, so one shape
 		// cannot describe them. Double the sample so the vocabulary model
 		// that takes over is built from enough pages, and say so: results
@@ -326,12 +374,18 @@ func (d *Discoverer) scanDir(ctx context.Context, dir string, depth int) ([]Resu
 	}
 
 	candidates := make([]string, 0, len(d.opts.Wordlist)*len(d.opts.Extensions))
+	expectedCand := map[string]bool{}
 	for _, w := range d.opts.Wordlist {
+		isExpected := d.opts.Expected[w]
 		for _, ext := range d.opts.Extensions {
 			if w = strings.TrimLeft(w, "/"); w == "" {
 				continue
 			}
-			candidates = append(candidates, joinDir(dir, w+ext))
+			c := joinDir(dir, w+ext)
+			candidates = append(candidates, c)
+			if isExpected {
+				expectedCand[c] = true
+			}
 		}
 	}
 
@@ -380,13 +434,14 @@ func (d *Discoverer) scanDir(ctx context.Context, dir string, depth int) ([]Resu
 			Headers:     captureHeaders(resp.Header),
 			path:        path,
 			forced:      forced,
+			expected:    expectedCand[path],
 		})
 	}
 
 	if rateLimited > 0 {
 		d.opts.OnWarning(dir, fmt.Errorf("%d of %d requests were still rate-limited (429) after backing off, so those paths were not checked — re-run with a lower -rate or -c", rateLimited, total))
 	}
-	results = d.recalibrateIfDrifted(ctx, dir, results, total)
+	results = d.recalibrateIfDrifted(ctx, dir, results, total-countExpected(expectedCand, total))
 	return results, nil
 }
 
@@ -448,7 +503,13 @@ func (d *Discoverer) recalibrateIfDrifted(ctx context.Context, dir string, resul
 // driftCheck is the body of recalibrateIfDrifted, run on calibrated
 // (non-forced) results only.
 func (d *Discoverer) driftCheck(ctx context.Context, dir string, results []Result, total int) []Result {
-	if len(results) == 0 || total == 0 || float64(len(results))/float64(total) <= driftHitRate {
+	unexpected := 0
+	for _, r := range results {
+		if !r.expected {
+			unexpected++
+		}
+	}
+	if unexpected == 0 || total <= 0 || float64(unexpected)/float64(total) <= driftHitRate {
 		return results
 	}
 	if total < driftMinSample {
@@ -456,7 +517,7 @@ func (d *Discoverer) driftCheck(ctx context.Context, dir string, results []Resul
 		// curated wordlist can legitimately hit often), but enough hits to
 		// be worth confirming: re-checking costs a few requests and genuine
 		// findings survive it.
-		if len(results) >= driftMinHits {
+		if unexpected >= driftMinHits {
 			return d.reverify(ctx, dir, results, total)
 		}
 		return results
@@ -498,13 +559,81 @@ func (d *Discoverer) driftCheck(ctx context.Context, dir string, results []Resul
 		kept = append(kept, res)
 	}
 	if dropped > 0 {
-		pct := 100 * float64(len(results)) / float64(total)
+		pct := 100 * float64(unexpected) / float64(total)
 		d.opts.OnWarning(dir, fmt.Errorf("hit rate %.0f%% is implausibly high — target likely began serving a block/challenge/wildcard page mid-scan; re-calibrated and dropped %d finding(s) that match the target's new behavior", pct, dropped))
 	}
-	if float64(len(kept))/float64(total) > driftHitRate {
+	stillUnexpected := 0
+	for _, r := range kept {
+		if !r.expected {
+			stillUnexpected++
+		}
+	}
+	if float64(stillUnexpected)/float64(total) > driftHitRate {
 		kept = d.reverify(ctx, dir, kept, total)
 	}
 	return kept
+}
+
+// countExpected returns how many candidates came from the target's own
+// word sources; they are excluded from the hit-rate denominator.
+func countExpected(expected map[string]bool, total int) int {
+	if n := len(expected); n < total {
+		return n
+	}
+	return 0
+}
+
+// minAnswered is the fewest calibration probes that must get an answer
+// before a directory's results can be trusted.
+const minAnswered = 2
+
+// dropRoutes filters directory candidates under a catch-all directory (one
+// that answers paths that cannot exist with a success page). There every
+// HTML page looks like a directory, and recursing into each one repeats the
+// catch-all under every route: the single-page-app case, where a 45-product
+// catalogue turned into 45 full wordlist passes. One request per candidate
+// tells them apart: a framework route redirects "X/" to "X" (strips the
+// slash), while a real directory serves "X/" or redirects "X" to "X/".
+func (d *Discoverer) dropRoutes(ctx context.Context, dir string, candidates []string) []string {
+	if len(candidates) == 0 || ctx.Err() != nil {
+		return candidates
+	}
+	origin := strings.TrimSuffix(d.opts.BaseURL, d.basePath)
+	reqs := make([]engine.Request, len(candidates))
+	for i, c := range candidates {
+		reqs[i] = engine.Request{Method: "GET", URL: origin + strings.TrimRight(c, "/") + "/"}
+	}
+	var keep []string
+	dropped := 0
+	for i, r := range d.eng.DoAll(ctx, reqs) {
+		c := strings.TrimRight(candidates[i], "/")
+		if r.Err == nil && r.Status >= 300 && r.Status < 400 && strings.TrimRight(pathOnly(r.RedirectTo), "/") == c && !strings.HasSuffix(pathOnly(r.RedirectTo), "/") {
+			dropped++
+			continue
+		}
+		keep = append(keep, candidates[i])
+	}
+	if dropped > 0 && !d.warnedCatchAll {
+		d.warnedCatchAll = true
+		d.opts.OnWarning(dir, fmt.Errorf("this site answers unknown paths with a success page and its pages strip a trailing slash (framework routes, typical of single-page apps such as Next.js) — %d such page(s) were not scanned as directories", dropped))
+	}
+	return keep
+}
+
+// pathOnly strips scheme, host, query and fragment from a Location value.
+func pathOnly(loc string) string {
+	if i := strings.Index(loc, "://"); i >= 0 {
+		loc = loc[i+3:]
+		if j := strings.Index(loc, "/"); j >= 0 {
+			loc = loc[j:]
+		} else {
+			loc = "/"
+		}
+	}
+	if i := strings.IndexAny(loc, "?#"); i >= 0 {
+		loc = loc[:i]
+	}
+	return loc
 }
 
 // reverify is the last line of defence against a flood: the hit rate is
