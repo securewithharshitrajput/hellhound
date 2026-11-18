@@ -1,5 +1,7 @@
 # HELLHOUND
 
+![Hellhound — calibrated recon that classifies what it finds](assets/wallpaper/hellhound-wallpaper-1080p.png)
+
 ```
 ██   ██  ███████  ██       ██       ██   ██  ███████  ██   ██  ██   ██  ██████
 ██   ██  ██       ██       ██       ██   ██  ██   ██  ██   ██  ███  ██  ██   ██
@@ -67,10 +69,10 @@ flowchart LR
 ## Install
 
 ```bash
-go install github.com/securewithharshitrajput/hellhound/cmd/hellhound@v0.10.0
+go install github.com/securewithharshitrajput/hellhound/cmd/hellhound@v0.11.0
 ```
 
-(Pin to a tagged version like `@v0.10.0` rather than `@latest` — Go's module proxy caches version lookups, and `@latest` against an untagged commit can serve a stale result until the proxy's cache naturally refreshes. A tagged release doesn't have that problem.)
+(Pin to a tagged version like `@v0.11.0` rather than `@latest` — Go's module proxy caches version lookups, and `@latest` against an untagged commit can serve a stale result until the proxy's cache naturally refreshes. A tagged release doesn't have that problem.)
 
 This drops a `hellhound` binary into `$(go env GOBIN)` (usually `~/go/bin`) — the same place `ffuf`/`katana` live. Make sure that's on your `PATH` and you're done:
 
@@ -192,6 +194,7 @@ The banner at the top is randomized per run (Metasploit-style rotating tips) and
 | `-no-tech` | `false` | Skip tech-stack fingerprinting + tech-specific wordlist injection |
 | `-no-security` | `false` | Skip Tier-A security checks (sensitive files, dir listing, dangerous HTTP methods, open-redirect, info-disclosure headers) |
 | `-no-banner` | `false` | Suppress the startup banner |
+| `-no-color` | `false` | Plain output without colours. Colour is only used on a terminal anyway (never in files, pipes or JSON/CSV/SARIF); `NO_COLOR=1` does the same, `FORCE_COLOR=1` forces it on (e.g. for `| less -R`) |
 | `-json` | — | Write the full clustered JSON report (incl. security findings) to this path |
 | `-csv` | — | Write findings as CSV (one row per finding, security findings tagged `security`) to this path |
 | `-sarif` | — | Write findings as SARIF 2.1.0 to this path (for CI / GitHub code scanning) |
@@ -215,6 +218,20 @@ The banner at the top is randomized per run (Metasploit-style rotating tips) and
 | `-show-known` | `false` | Also list hits that are pages the site already publishes (sitemap, crawled links, homepage assets, `robots.txt`); by default only discoveries are listed |
 | `-no-auto-throttle` | `false` | Do not slow down automatically when the target starts timing out |
 | `-version` | | Print the version and exit |
+
+### Reading the output
+
+On a terminal, hellhound colours what matters so a long scan can be read at a glance:
+
+| Colour | Means |
+|---|---|
+| green `[200]` | the path exists and answered normally |
+| cyan `[301]` | a redirect — often a directory (`/x` → `/x/`) or a login wall |
+| yellow `[401]` `[403]` | exists but protected |
+| magenta `[4xx]` | other client errors |
+| red `[500]` | the path exists and the server failed handling it |
+| white on red `[HIGH]` · orange `[MEDIUM]` · yellow `[LOW]` · grey `[INFO]` | security finding severity |
+| `▶` bold | a phase is starting · `✓` green: a phase finished · `!` yellow: a warning · `x` red: an error |
 
 ### Tier-A security findings
 

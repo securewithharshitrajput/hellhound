@@ -21,7 +21,7 @@ import (
 
 // Version is the tool's displayed version. Bump this on meaningful
 // feature changes.
-const Version = "0.10.0"
+const Version = "0.11.0"
 
 // Tagline appears under the logo and in the no-TTY fallback line.
 const Tagline = "calibrated recon that classifies what it finds"
@@ -114,6 +114,14 @@ func renderLogo(word string) string {
 
 var logo = renderLogo(Name)
 
+// Plain drops the colour codes from the terminal banner (set from
+// -no-color / NO_COLOR); the logo itself is still drawn.
+var Plain bool
+
+// Force draws the full logo even when stderr is not detected as a terminal
+// (set when FORCE_COLOR asks for colour on a pipe, e.g. "| less -R").
+var Force bool
+
 func isTerminal(f *os.File) bool {
 	info, err := f.Stat()
 	if err != nil {
@@ -132,18 +140,15 @@ func Print(suppress bool) {
 	w := os.Stderr
 	tip := tips[rand.Intn(len(tips))]
 
-	if !isTerminal(w) {
+	if !isTerminal(w) && !Force {
 		fmt.Fprintf(w, "hellhound v%s — %s\n%s\n\n", Version, Tagline, tip)
 		return
 	}
 
-	const (
-		bold   = "\x1b[1m"
-		red    = "\x1b[31m"
-		orange = "\x1b[38;5;208m"
-		dim    = "\x1b[2m"
-		reset  = "\x1b[0m"
-	)
+	bold, red, orange, dim, reset := "\x1b[1m", "\x1b[31m", "\x1b[38;5;208m", "\x1b[2m", "\x1b[0m"
+	if Plain {
+		bold, red, orange, dim, reset = "", "", "", "", ""
+	}
 
 	fmt.Fprint(w, red+bold+logo+reset)
 	fmt.Fprintf(w, "        %sv%s%s  %s%s%s\n", orange+bold, Version, reset, dim, Tagline, reset)

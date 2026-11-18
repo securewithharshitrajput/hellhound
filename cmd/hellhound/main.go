@@ -28,6 +28,7 @@ import (
 	"github.com/securewithharshitrajput/hellhound/internal/render"
 	"github.com/securewithharshitrajput/hellhound/internal/report"
 	"github.com/securewithharshitrajput/hellhound/internal/scope"
+	"github.com/securewithharshitrajput/hellhound/internal/style"
 	"github.com/securewithharshitrajput/hellhound/internal/wordlist"
 	"path"
 	"sort"
@@ -56,6 +57,9 @@ func (h headerFlag) Set(v string) error {
 	h[k] = val
 	return nil
 }
+
+// errw is where the log goes: stderr, coloured by meaning on a terminal.
+var errw io.Writer = os.Stderr
 
 func main() {
 	headers := headerFlag{}
@@ -99,6 +103,7 @@ func main() {
 		crawlSimilar = flag.Int("crawl-similar", 5, "follow at most this many links per URL pattern (/products/{id}, /blog/{id}...); 0 = unlimited")
 		showAssets   = flag.Bool("show-assets", false, "list every static asset (JS, CSS, fonts, images) found by -crawl instead of one summary line")
 		noThrottle   = flag.Bool("no-auto-throttle", false, "do not slow down automatically when the target starts timing out")
+		noColor      = flag.Bool("no-color", false, "plain output without colours (colour is only ever used on a terminal; NO_COLOR is honoured too)")
 		showKnown    = flag.Bool("show-known", false, "also list pages the site already publishes (sitemap, crawled links, homepage assets); by default only discoveries are listed")
 	)
 	flag.String("config", "", "config file with one \"name = value\" per line (any flag); the command line overrides it")
@@ -106,7 +111,7 @@ func main() {
 	flag.Var(headers, "H", `custom header, repeatable, format "Name: value" (e.g. -H "Authorization: Bearer xyz")`)
 	args, argErr := expandArgs(flag.CommandLine, os.Args[1:])
 	if argErr != nil {
-		fmt.Fprintf(os.Stderr, "hellhound: %v\n", argErr)
+		fmt.Fprintf(errw, "hellhound: %v\n", argErr)
 		os.Exit(2)
 	}
 	flag.CommandLine.Parse(args)
@@ -115,20 +120,28 @@ func main() {
 		fmt.Printf("hellhound %s\n", banner.Version)
 		return
 	}
+	// Colour only where a person is reading: each stream is checked on its
+	// own, so "hellhound ... > findings.txt" keeps a plain file while the
+	// log on the terminal stays coloured.
+	style.Out.On = style.Detect(os.Stdout, *noColor)
+	style.Err.On = style.Detect(os.Stderr, *noColor)
+	errw = style.LogWriter{W: os.Stderr, P: style.Err}
+	banner.Plain = !style.Err.On
+	banner.Force = style.Err.On
 	banner.Print(*noBanner)
 
 	if *target == "" {
-		fmt.Fprintln(os.Stderr, "usage: hellhound -u http://target [-w wordlist.txt] [-H \"Name: value\"] [-k] [-depth 2] [-ext .bak,.old] [-json out.json]")
-		fmt.Fprintln(os.Stderr, "\nFor authorized security testing only — only point this at targets you are authorized to test.")
+		fmt.Fprintln(errw, "usage: hellhound -u http://target [-w wordlist.txt] [-H \"Name: value\"] [-k] [-depth 2] [-ext .bak,.old] [-json out.json]")
+		fmt.Fprintln(errw, "\nFor authorized security testing only — only point this at targets you are authorized to test.")
 		os.Exit(2)
 	}
 	if err := validateFlags(*concurrency, *depth, *calibN, *rate, *maxBodyKB, *crawlDepth, *crawlMax, *timeout); err != nil {
-		fmt.Fprintf(os.Stderr, "hellhound: %v\n", err)
+		fmt.Fprintf(errw, "hellhound: %v\n", err)
 		os.Exit(2)
 	}
 	baseURL, err := normalizeTarget(*target)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "hellhound: invalid target %q: %v\n", *target, err)
+		fmt.Fprintf(errw, "hellhound: invalid target %q: %v\n", *target, err)
 		os.Exit(2)
 	}
 	// Input and output files are checked before anything is sent: a typo in
@@ -185,7 +198,7 @@ func main() {
 	if err == nil && *renderJS {
 		if !*crawl {
 			*crawl = true
-			fmt.Fprintln(os.Stderr, "hellhound: -render implies -crawl; crawling enabled")
+			fmt.Fprintln(errw, "hellhound: -render implies -crawl; crawling enabled")
 		}
 		renderer, err = newRenderer(*renderBin, *proxyURL, *insecure, *timeout, len(headers) > 0)
 	}
@@ -196,7 +209,7 @@ func main() {
 		err = fmt.Errorf("-crawl-similar must be 0 (unlimited) or more (got %d)", *crawlSimilar)
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "hellhound: %v\n", err)
+		fmt.Fprintf(errw, "hellhound: %v\n", err)
 		os.Exit(2)
 	}
 
@@ -222,17 +235,18 @@ func main() {
 	}
 	eng, err := engine.NewErr(cfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "hellhound: %v\n", err)
+		fmt.Fprintf(errw, "hellhound: %v\n", err)
 		os.Exit(2)
 	}
 	prog = newProgress(os.Stderr, !*noProgress, eng.Sent.Load)
+	prog.w = errw
 	defer eng.Close() // not load-bearing for a one-shot process (the OS reclaims everything on exit), but correct practice and free
 
 	if *proxyURL != "" {
-		fmt.Fprintf(os.Stderr, "hellhound: routing all requests through proxy %s\n", *proxyURL)
+		fmt.Fprintf(errw, "hellhound: routing all requests through proxy %s\n", *proxyURL)
 	}
 	if *rate > 0 {
-		fmt.Fprintf(os.Stderr, "hellhound: rate limited to %d request(s)/sec\n", *rate)
+		fmt.Fprintf(errw, "hellhound: rate limited to %d request(s)/sec\n", *rate)
 	}
 
 	// A plain context.Background() here would mean Ctrl+C just kills the
@@ -272,8 +286,8 @@ func main() {
 	// exit 0 — indistinguishable from a real scan of a clean target.
 	pre := eng.DoAll(ctx, []engine.Request{{Method: "GET", URL: baseURL + "/"}})
 	if len(pre) == 1 && pre[0].Err != nil && ctx.Err() == nil {
-		fmt.Fprintf(os.Stderr, "hellhound: target is not reachable: %v\n", pre[0].Err)
-		fmt.Fprintln(os.Stderr, "hellhound: nothing was scanned (check the URL, scheme and port; use -k for a self-signed certificate on an authorized dev/staging target)")
+		fmt.Fprintf(errw, "hellhound: target is not reachable: %v\n", pre[0].Err)
+		fmt.Fprintln(errw, "hellhound: nothing was scanned (check the URL, scheme and port; use -k for a self-signed certificate on an authorized dev/staging target)")
 		os.Exit(1)
 	}
 
@@ -285,7 +299,7 @@ func main() {
 		// and do not repeat the preparation phases.
 		words, *depth, *calibN = state.Words, state.MaxDepth, state.CalibN
 		*noMine, *noTechMine, *crawl = true, true, false
-		fmt.Fprintf(os.Stderr, "hellhound: resuming from %s — %d director(ies) already done, %d queued, %d finding(s) so far (wordlist, -ext, -depth and -calibrate are taken from the saved scan)\n",
+		fmt.Fprintf(errw, "hellhound: resuming from %s — %d director(ies) already done, %d queued, %d finding(s) so far (wordlist, -ext, -depth and -calibrate are taken from the saved scan)\n",
 			*resumeFile, state.Checkpoint.DirsDone, len(state.Checkpoint.Pending), len(state.Checkpoint.Results))
 	}
 	// Words taken from the target itself (sitemap, robots.txt, links) are
@@ -308,7 +322,7 @@ func main() {
 		}
 	}
 	if !*noMine {
-		fmt.Fprintf(os.Stderr, "hellhound: mining robots.txt + sitemap.xml + homepage + linked JS for target-derived words...\n")
+		fmt.Fprintf(errw, "hellhound: mining robots.txt + sitemap.xml + homepage + linked JS for target-derived words...\n")
 		var ms discover.MineStats
 		words, ms = discover.BuildWordlistStats(scanCtx, eng, baseURL, seed)
 		markExpected(seed, words)
@@ -320,10 +334,10 @@ func main() {
 			known[knownKey(origin+p)] = true
 		}
 		if extra := len(words) - len(seed); extra > 0 {
-			fmt.Fprintf(os.Stderr, "hellhound: mined %d additional word(s) from the target itself\n", extra)
+			fmt.Fprintf(errw, "hellhound: mined %d additional word(s) from the target itself\n", extra)
 		}
 		if len(ms.Failed) > 0 && scanCtx.Err() == nil {
-			fmt.Fprintf(os.Stderr, "hellhound: warning: could not read %s — the target may be blocking or throttling this client, so fewer words were mined and tech detection may miss the stack\n", strings.Join(ms.Failed, ", "))
+			fmt.Fprintf(errw, "hellhound: warning: could not read %s — the target may be blocking or throttling this client, so fewer words were mined and tech detection may miss the stack\n", strings.Join(ms.Failed, ", "))
 		}
 	}
 
@@ -338,12 +352,12 @@ func main() {
 			for i, t := range detectedTechs {
 				names[i] = string(t)
 			}
-			fmt.Fprintf(os.Stderr, "hellhound: detected stack(s): %s\n", strings.Join(names, ", "))
+			fmt.Fprintf(errw, "hellhound: detected stack(s): %s\n", strings.Join(names, ", "))
 			if tw := discover.WordsForTechs(detectedTechs); len(tw) > 0 {
 				before := len(words)
 				words = wordlist.Merge(words, tw)
 				if added := len(words) - before; added > 0 {
-					fmt.Fprintf(os.Stderr, "hellhound: injected %d tech-specific word(s)\n", added)
+					fmt.Fprintf(errw, "hellhound: injected %d tech-specific word(s)\n", added)
 				}
 			}
 		}
@@ -368,7 +382,7 @@ func main() {
 			words = wordlist.Merge(words, cw)
 			markExpected(prev, words)
 			if added := len(words) - before; added > 0 {
-				fmt.Fprintf(os.Stderr, "hellhound: crawl contributed %d new fuzz word(s)\n", added)
+				fmt.Fprintf(errw, "hellhound: crawl contributed %d new fuzz word(s)\n", added)
 			}
 		}
 	}
@@ -385,7 +399,7 @@ func main() {
 				continue
 			}
 			if !validExt(e) {
-				fmt.Fprintf(os.Stderr, "hellhound: invalid -ext entry %q: an extension starts with '.' or '~' and contains only letters, digits, '.', '_', '-' and '~' (e.g. .bak,.old,~)\n", e)
+				fmt.Fprintf(errw, "hellhound: invalid -ext entry %q: an extension starts with '.' or '~' and contains only letters, digits, '.', '_', '-' and '~' (e.g. .bak,.old,~)\n", e)
 				os.Exit(2)
 			}
 			exts = append(exts, e)
@@ -440,14 +454,14 @@ func main() {
 	}
 	d := discover.New(eng, opts)
 
-	fmt.Fprintf(os.Stderr, "hellhound: calibrating + scanning %s with %d words x %d extensions (depth=%d, concurrency=%d)\n",
+	fmt.Fprintf(errw, "hellhound: calibrating + scanning %s with %d words x %d extensions (depth=%d, concurrency=%d)\n",
 		*target, len(words), len(exts), *depth, *concurrency)
 
 	start := time.Now()
 	results, err := d.Run(scanCtx, "/")
 	prog.Clear()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "hellhound: error: %v\n", err)
+		fmt.Fprintf(errw, "hellhound: error: %v\n", err)
 		os.Exit(1)
 	}
 	interrupted := ctx.Err() != nil
@@ -457,27 +471,27 @@ func main() {
 		if timedOut {
 			why = fmt.Sprintf("reached -max-time %s", *maxTime)
 		}
-		fmt.Fprintf(os.Stderr, "hellhound: %s after %s, sent %d requests — showing partial results below\n",
+		fmt.Fprintf(errw, "hellhound: %s after %s, sent %d requests — showing partial results below\n",
 			why, time.Since(start).Round(time.Millisecond), eng.Sent.Load())
 		if *resumeFile != "" && !stateFailed {
-			fmt.Fprintf(os.Stderr, "hellhound: progress is saved in %s — run the same command again to continue from the last completed directory\n", *resumeFile)
+			fmt.Fprintf(errw, "hellhound: progress is saved in %s — run the same command again to continue from the last completed directory\n", *resumeFile)
 		} else if *resumeFile == "" {
-			fmt.Fprintln(os.Stderr, "hellhound: tip: add -resume <file> to be able to continue an interrupted scan")
+			fmt.Fprintln(errw, "hellhound: tip: add -resume <file> to be able to continue an interrupted scan")
 		}
-		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(errw)
 	} else {
 		if *resumeFile != "" {
 			os.Remove(*resumeFile) // finished: nothing left to resume
 		}
-		fmt.Fprintf(os.Stderr, "hellhound: done in %s, sent %d requests (%d backoff pauses)\n\n",
+		fmt.Fprintf(errw, "hellhound: done in %s, sent %d requests (%d backoff pauses)\n\n",
 			time.Since(start).Round(time.Millisecond), eng.Sent.Load(), eng.Backoffs.Load())
 	}
 	if n := eng.Throttles.Load(); n > 0 {
-		fmt.Fprintf(os.Stderr, "hellhound: slowed down %d time(s) because the target was timing out; finished at %d request(s)/sec\n", n, eng.RatePerSec())
+		fmt.Fprintf(errw, "hellhound: slowed down %d time(s) because the target was timing out; finished at %d request(s)/sec\n", n, eng.RatePerSec())
 	}
 
 	if d.Blocked() {
-		fmt.Fprintln(os.Stderr, "hellhound: warning: the target's firewall blocked part of this scan, so the results below are INCOMPLETE — wait a while and re-run with a lower -rate (e.g. -rate 3 -c 2) to cover the rest")
+		fmt.Fprintln(errw, "hellhound: warning: the target's firewall blocked part of this scan, so the results below are INCOMPLETE — wait a while and re-run with a lower -rate (e.g. -rate 3 -c 2) to cover the rest")
 	}
 
 	listed := results
@@ -492,7 +506,7 @@ func main() {
 			listed = append(listed, r)
 		}
 		if hidden > 0 {
-			fmt.Fprintf(os.Stderr, "hellhound: %d hit(s) are pages or assets the site already links to (sitemap, crawl, homepage) — not listed as findings; add -show-known to include them\n", hidden)
+			fmt.Fprintf(errw, "hellhound: %d hit(s) are pages or assets the site already links to (sitemap, crawl, homepage) — not listed as findings; add -show-known to include them\n", hidden)
 		}
 	}
 	rep := report.Build(*target, listed)
@@ -528,7 +542,7 @@ func main() {
 	writeOutput("SARIF", *sarifOut, rep, report.WriteSARIF)
 
 	if n := eng.Blocked.Load(); n > 0 {
-		fmt.Fprintf(os.Stderr, "hellhound: %d request(s) were not sent because they fell outside the allowed scope\n", n)
+		fmt.Fprintf(errw, "hellhound: %d request(s) were not sent because they fell outside the allowed scope\n", n)
 	}
 	if interrupted {
 		// Partial results were printed and written, but the scan did not
@@ -550,9 +564,9 @@ func main() {
 func runSecurityScans(ctx context.Context, eng *engine.Engine, baseURL string, results []discover.Result, rootSens []discover.SecurityFinding, passiveOnly bool) []discover.SecurityFinding {
 	start := time.Now()
 	if passiveOnly {
-		fmt.Fprintf(os.Stderr, "\nhellhound: interrupted — running only the security checks that need no further requests (dir listings, info-disclosure headers); sensitive files were checked at the root before fuzzing\n")
+		fmt.Fprintf(errw, "\nhellhound: interrupted — running only the security checks that need no further requests (dir listings, info-disclosure headers); sensitive files were checked at the root before fuzzing\n")
 	} else {
-		fmt.Fprintf(os.Stderr, "\nhellhound: running Tier-A security checks (sensitive files, dir listings, dangerous methods, open-redirect, info-disclosure)...\n")
+		fmt.Fprintf(errw, "\nhellhound: running Tier-A security checks (sensitive files, dir listings, dangerous methods, open-redirect, info-disclosure)...\n")
 	}
 
 	findings := append([]discover.SecurityFinding{}, rootSens...)
@@ -561,17 +575,17 @@ func runSecurityScans(ctx context.Context, eng *engine.Engine, baseURL string, r
 	findings = append(findings, discover.ClassifyDirListings(results)...)
 	findings = append(findings, discover.CaptureInfoDisclosure(results)...)
 	if passiveOnly {
-		fmt.Fprintf(os.Stderr, "hellhound: security checks done in %s — %d finding(s)\n", time.Since(start).Round(time.Millisecond), len(findings))
+		fmt.Fprintf(errw, "hellhound: security checks done in %s — %d finding(s)\n", time.Since(start).Round(time.Millisecond), len(findings))
 		return findings
 	}
 
 	// Sensitive-file probes in the discovered directories (the root was
 	// probed before fuzzing).
-	fmt.Fprintf(os.Stderr, "hellhound: security: probing sensitive files in discovered directories...\n")
+	fmt.Fprintf(errw, "hellhound: security: probing sensitive files in discovered directories...\n")
 	sens, skipped := discover.ScanSensitiveIn(ctx, eng, baseURL, results, false)
 	findings = append(findings, sens...)
 	if skipped > 0 {
-		fmt.Fprintf(os.Stderr, "hellhound: sensitive-file probes ran at the root and the first 10 discovered directories; %d more directories were not probed\n", skipped)
+		fmt.Fprintf(errw, "hellhound: sensitive-file probes ran at the root and the first 10 discovered directories; %d more directories were not probed\n", skipped)
 	}
 
 	// 4) Dangerous HTTP methods (one OPTIONS per unique discovered URL).
@@ -582,7 +596,7 @@ func runSecurityScans(ctx context.Context, eng *engine.Engine, baseURL string, r
 		}
 	}
 	if ctx.Err() == nil {
-		fmt.Fprintf(os.Stderr, "hellhound: security: checking HTTP methods on %d URL(s)...\n", len(urls))
+		fmt.Fprintf(errw, "hellhound: security: checking HTTP methods on %d URL(s)...\n", len(urls))
 	}
 	findings = append(findings, discover.ScanDangerousMethods(ctx, eng, urls)...)
 
@@ -594,7 +608,7 @@ func runSecurityScans(ctx context.Context, eng *engine.Engine, baseURL string, r
 	// 6) Test/staging/backup copies of the site (/test/, /staging/, /old/).
 	findings = append(findings, discover.ScanExposedCopies(ctx, eng, baseURL, results)...)
 
-	fmt.Fprintf(os.Stderr, "hellhound: security checks done in %s — %d finding(s)\n", time.Since(start).Round(time.Millisecond), len(findings))
+	fmt.Fprintf(errw, "hellhound: security checks done in %s — %d finding(s)\n", time.Since(start).Round(time.Millisecond), len(findings))
 	return findings
 }
 
@@ -752,15 +766,15 @@ func writeOutput(label, path string, rep report.JSONReport, write func(io.Writer
 	}
 	f, err := os.Create(path)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "hellhound: could not write %s report: %v\n", label, err)
+		fmt.Fprintf(errw, "hellhound: could not write %s report: %v\n", label, err)
 		os.Exit(1)
 	}
 	defer f.Close()
 	if err := write(f, rep); err != nil {
-		fmt.Fprintf(os.Stderr, "hellhound: error encoding %s report: %v\n", label, err)
+		fmt.Fprintf(errw, "hellhound: error encoding %s report: %v\n", label, err)
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stderr, "hellhound: wrote %s report to %s\n", label, path)
+	fmt.Fprintf(errw, "hellhound: wrote %s report to %s\n", label, path)
 }
 
 // runAPIDiscovery actively probes conventional OpenAPI/Swagger and GraphQL
@@ -794,7 +808,7 @@ const (
 func runAPIDiscovery(ctx context.Context, eng *engine.Engine, baseURL string) {
 	total := len(discover.CommonSpecPaths) + len(discover.CommonGraphQLPaths)
 	start := time.Now()
-	fmt.Fprintf(os.Stderr, "hellhound: probing %d common OpenAPI/GraphQL locations...\n", total)
+	fmt.Fprintf(errw, "hellhound: probing %d common OpenAPI/GraphQL locations...\n", total)
 
 	reqs := make([]engine.Request, 0, total)
 	kinds := make([]apiProbeKind, 0, total)
@@ -821,6 +835,7 @@ func runAPIDiscovery(ctx context.Context, eng *engine.Engine, baseURL string) {
 	}
 
 	resps := eng.DoAll(ctx, reqs)
+	o := style.Out
 
 	for i, resp := range resps {
 		p := paths[i]
@@ -832,35 +847,35 @@ func runAPIDiscovery(ctx context.Context, eng *engine.Engine, baseURL string) {
 			routes, err := discover.ParseOpenAPI(resp.Body)
 			if err != nil {
 				if resp.Truncated {
-					fmt.Fprintf(os.Stderr, "hellhound: warning: %s looked like it might be an OpenAPI spec but was truncated at %d bytes — raise -maxbody and retry\n", p, resp.Length)
+					fmt.Fprintf(errw, "hellhound: warning: %s looked like it might be an OpenAPI spec but was truncated at %d bytes — raise -maxbody and retry\n", p, resp.Length)
 				}
 				continue
 			}
 			if len(routes) == 0 {
 				continue
 			}
-			fmt.Printf("\n[openapi] spec found at %s — %d routes declared:\n", p, len(routes))
+			fmt.Printf("\n%s spec found at %s — %s\n", o.Section("openapi"), o.Bold(p), o.Bold(fmt.Sprintf("%d routes declared:", len(routes))))
 			for _, r := range routes {
-				fmt.Printf("    %-7s %s\n", report.Clean(r.Method), report.Clean(r.Path))
+				fmt.Printf("    %s %s\n", methodStyle(o, fmt.Sprintf("%-7s", report.Clean(r.Method))), report.Clean(r.Path))
 			}
 		case probeGraphQL:
 			fields, err := discover.ParseGraphQLIntrospection(resp.Body)
 			if err != nil {
 				if resp.Truncated {
-					fmt.Fprintf(os.Stderr, "hellhound: warning: %s response was truncated at %d bytes — raise -maxbody and retry\n", p, resp.Length)
+					fmt.Fprintf(errw, "hellhound: warning: %s response was truncated at %d bytes — raise -maxbody and retry\n", p, resp.Length)
 				}
 				continue
 			}
 			if len(fields) == 0 {
 				continue
 			}
-			fmt.Printf("\n[graphql] introspection enabled at %s — %d root fields exposed:\n", p, len(fields))
+			fmt.Printf("\n%s introspection enabled at %s — %s\n", o.Section("graphql"), o.Bold(p), o.Bold(fmt.Sprintf("%d root fields exposed:", len(fields))))
 			for _, f := range fields {
 				fmt.Printf("    %s.%s\n", report.Clean(f.ParentType), report.Clean(f.Field))
 			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "hellhound: API probing done in %s\n", time.Since(start).Round(time.Millisecond))
+	fmt.Fprintf(errw, "hellhound: API probing done in %s\n", time.Since(start).Round(time.Millisecond))
 }
 
 // runVHostScan probes -u with each candidate hostname as the Host header,
@@ -872,18 +887,19 @@ func runAPIDiscovery(ctx context.Context, eng *engine.Engine, baseURL string) {
 func runVHostScan(ctx context.Context, eng *engine.Engine, baseURL, vhostFile string, calibN int) {
 	candidates := loadWordlistFile(vhostFile)
 	if len(candidates) == 0 {
-		fmt.Fprintf(os.Stderr, "hellhound: warning: -vhosts file %s had no usable entries, skipping vhost scan\n", vhostFile)
+		fmt.Fprintf(errw, "hellhound: warning: -vhosts file %s had no usable entries, skipping vhost scan\n", vhostFile)
 		return
 	}
-	fmt.Fprintf(os.Stderr, "\nhellhound: vhost scanning %s with %d candidate hostname(s)...\n", baseURL, len(candidates))
+	fmt.Fprintf(errw, "\nhellhound: vhost scanning %s with %d candidate hostname(s)...\n", baseURL, len(candidates))
 	results := discover.VHostScan(ctx, eng, baseURL, candidates, calibN)
 	if len(results) == 0 {
-		fmt.Println("\n[vhost] no distinct virtual hosts found (every candidate matched the default-vhost baseline)")
+		fmt.Printf("\n%s no distinct virtual hosts found (every candidate matched the default-vhost baseline)\n", style.Out.Section("vhost"))
 		return
 	}
-	fmt.Printf("\n[vhost] %d distinct virtual host(s) found:\n", len(results))
+	o := style.Out
+	fmt.Printf("\n%s %s\n", o.Section("vhost"), o.Bold(fmt.Sprintf("%d distinct virtual host(s) found:", len(results))))
 	for _, r := range results {
-		fmt.Printf("    %-40s [%d] len=%d  %s\n", report.Clean(r.Host), r.Status, r.Length, report.Clean(r.Reason))
+		fmt.Printf("    %-40s %s %s  %s\n", report.Clean(r.Host), o.Status(r.Status), o.Grey(fmt.Sprintf("len=%d", r.Length)), report.Clean(r.Reason))
 	}
 }
 
@@ -892,21 +908,21 @@ func runVHostScan(ctx context.Context, eng *engine.Engine, baseURL, vhostFile st
 // gap this closes versus katana.
 func runCrawl(ctx context.Context, eng *engine.Engine, baseURL string, depth, maxPages, maxSimilar int, showAssets bool, render discover.Renderer) ([]discover.CrawlResult, []discover.Form) {
 	start := time.Now()
-	fmt.Fprintf(os.Stderr, "\nhellhound: crawling %s for linked pages (max depth %d, max %d pages)...\n", baseURL, depth, maxPages)
+	fmt.Fprintf(errw, "\nhellhound: crawling %s for linked pages (max depth %d, max %d pages)...\n", baseURL, depth, maxPages)
 	renderErrs := 0
 	results, stats := discover.CrawlOpts(ctx, eng, baseURL, discover.CrawlConfig{
 		MaxDepth: depth, MaxPages: maxPages, Render: render, MaxSimilar: maxSimilar,
 		OnRenderError: func(pageURL string, err error) {
 			if renderErrs++; renderErrs <= 3 {
-				fmt.Fprintf(os.Stderr, "hellhound: warning: could not render %s: %s\n", report.Clean(pageURL), report.Clean(err.Error()))
+				fmt.Fprintf(errw, "hellhound: warning: could not render %s: %s\n", report.Clean(pageURL), report.Clean(err.Error()))
 			}
 		},
 	})
 	if renderErrs > 3 {
-		fmt.Fprintf(os.Stderr, "hellhound: warning: %d more page(s) could not be rendered\n", renderErrs-3)
+		fmt.Fprintf(errw, "hellhound: warning: %d more page(s) could not be rendered\n", renderErrs-3)
 	}
 	if len(results) == 0 {
-		fmt.Println("\n[crawl] no additional linked pages found")
+		fmt.Printf("\n%s no additional linked pages found\n", style.Out.Section("crawl"))
 	} else {
 		var pages []discover.CrawlResult
 		assets := map[string]int{}
@@ -919,9 +935,10 @@ func runCrawl(ctx context.Context, eng *engine.Engine, baseURL string, depth, ma
 			}
 			pages = append(pages, r)
 		}
-		fmt.Printf("\n[crawl] %d linked page(s) found by following links:\n", len(pages))
+		o := style.Out
+		fmt.Printf("\n%s %s\n", o.Section("crawl"), o.Bold(fmt.Sprintf("%d linked page(s) found by following links:", len(pages))))
 		for _, r := range pages {
-			fmt.Printf("    [%d] (depth %d) %s\n", r.Status, r.Depth, report.Clean(r.URL))
+			fmt.Printf("    %s %s %s\n", o.Status(r.Status), o.Grey(fmt.Sprintf("(depth %d)", r.Depth)), report.Clean(r.URL))
 		}
 		if nAssets > 0 {
 			kinds := make([]string, 0, len(assets))
@@ -933,7 +950,7 @@ func runCrawl(ctx context.Context, eng *engine.Engine, baseURL string, depth, ma
 			for i, k := range kinds {
 				parts[i] = fmt.Sprintf("%s %d", k, assets[k])
 			}
-			fmt.Printf("    + %d static asset(s) not listed (%s) — add -show-assets to list them\n", nAssets, strings.Join(parts, ", "))
+			fmt.Printf("    %s\n", style.Out.Grey(fmt.Sprintf("+ %d static asset(s) not listed (%s) — add -show-assets to list them", nAssets, strings.Join(parts, ", "))))
 		}
 		if len(stats.Capped) > 0 {
 			pats := make([]string, 0, len(stats.Capped))
@@ -942,13 +959,26 @@ func runCrawl(ctx context.Context, eng *engine.Engine, baseURL string, depth, ma
 			}
 			sort.Strings(pats)
 			for _, p := range pats {
-				fmt.Printf("    + %d more link(s) like %s not followed (limit %d per pattern; raise -crawl-similar to follow them)\n", stats.Capped[p], report.Clean(p), maxSimilar)
+				fmt.Printf("    %s\n", style.Out.Grey(fmt.Sprintf("+ %d more link(s) like %s not followed (limit %d per pattern; raise -crawl-similar to follow them)", stats.Capped[p], report.Clean(p), maxSimilar)))
 			}
 		}
 	}
 	printForms(stats.Forms)
-	fmt.Fprintf(os.Stderr, "hellhound: crawl done in %s\n", time.Since(start).Round(time.Millisecond))
+	fmt.Fprintf(errw, "hellhound: crawl done in %s\n", time.Since(start).Round(time.Millisecond))
 	return results, stats.Forms
+}
+
+// methodStyle colours an HTTP method: reads green, writes yellow, DELETE red.
+func methodStyle(o style.Palette, m string) string {
+	switch strings.TrimSpace(strings.ToUpper(m)) {
+	case "GET", "HEAD", "OPTIONS":
+		return o.Green(m)
+	case "POST", "PUT", "PATCH":
+		return o.Yellow(m)
+	case "DELETE":
+		return o.Red(m)
+	}
+	return m
 }
 
 // printForms lists the forms the crawl saw. They are only described: a form
@@ -957,7 +987,8 @@ func printForms(forms []discover.Form) {
 	if len(forms) == 0 {
 		return
 	}
-	fmt.Printf("\n[forms] %d form(s) found (listed only, never submitted):\n", len(forms))
+	o := style.Out
+	fmt.Printf("\n%s %s %s\n", o.Section("forms"), o.Bold(fmt.Sprintf("%d form(s) found", len(forms))), o.Grey("(listed only, never submitted):"))
 	for _, f := range forms {
 		var tags []string
 		if f.HasPassword {
@@ -971,9 +1002,9 @@ func printForms(forms []discover.Form) {
 		}
 		extra := ""
 		if len(tags) > 0 {
-			extra = "  [" + strings.Join(tags, ", ") + "]"
+			extra = "  " + o.Yellow("["+strings.Join(tags, ", ")+"]")
 		}
-		fmt.Printf("    %-4s %s  fields: %s%s\n", f.Method, report.Clean(f.Action), report.Clean(strings.Join(f.Fields, ", ")), extra)
+		fmt.Printf("    %s %s  %s %s%s\n", methodStyle(o, fmt.Sprintf("%-4s", f.Method)), report.Clean(f.Action), o.Grey("fields:"), report.Clean(strings.Join(f.Fields, ", ")), extra)
 	}
 }
 
@@ -1005,7 +1036,7 @@ func loadWordlistFile(path string) []string {
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "hellhound: warning: could not read wordlist %s: %v\n", path, err)
+		fmt.Fprintf(errw, "hellhound: warning: could not read wordlist %s: %v\n", path, err)
 		return nil
 	}
 	return parseList(data)
@@ -1068,9 +1099,9 @@ func newRenderer(browser, proxy string, insecure bool, timeout time.Duration, ha
 	if err != nil {
 		return nil, fmt.Errorf("-render: %v", err)
 	}
-	fmt.Fprintf(os.Stderr, "hellhound: rendering pages with %s (confined to the target host)\n", path)
+	fmt.Fprintf(errw, "hellhound: rendering pages with %s (confined to the target host)\n", path)
 	if hasHeaders {
-		fmt.Fprintln(os.Stderr, "hellhound: note: the browser does not send -H headers, so pages are rendered as an anonymous visitor; the crawler's own requests still carry them")
+		fmt.Fprintln(errw, "hellhound: note: the browser does not send -H headers, so pages are rendered as an anonymous visitor; the crawler's own requests still carry them")
 	}
 	c := &render.Chrome{Path: path, Timeout: timeout + 20*time.Second, Proxy: proxy, Insecure: insecure, UserAgent: "hellhound/" + banner.Version + " (+authorized-testing; headless)"}
 	return c.DOM, nil

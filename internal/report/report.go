@@ -4,6 +4,8 @@
 package report
 
 import (
+	"github.com/securewithharshitrajput/hellhound/internal/style"
+
 	"encoding/json"
 	"fmt"
 	"io"
@@ -112,13 +114,14 @@ func WriteJSON(w io.Writer, r JSONReport) error {
 // WriteSummary writes a compact, human-readable cluster summary — the
 // "read this in ten seconds" view.
 func WriteSummary(w io.Writer, r JSONReport) {
-	fmt.Fprintf(w, "hellhound: %d findings in %d cluster(s) for %s\n\n", r.Total, len(r.Clusters), r.Target)
+	o := style.Out
+	fmt.Fprintf(w, "%s %s for %s\n\n", o.Orange("hellhound:"), o.Bold(fmt.Sprintf("%d findings in %d cluster(s)", r.Total, len(r.Clusters))), r.Target)
 	for _, c := range r.Clusters {
 		tag := ""
 		if c.MemberCount > 1 {
-			tag = fmt.Sprintf(" (+%d similar)", c.MemberCount-1)
+			tag = o.Grey(fmt.Sprintf(" (+%d similar)", c.MemberCount-1))
 		}
-		fmt.Fprintf(w, "  [%d] %-60s len=%-6d %s%s\n", c.Representative.Status, c.Representative.URL, c.Representative.Length, c.Representative.Reason, tag)
+		fmt.Fprintf(w, "  %s %-60s %s %s%s\n", o.Status(c.Representative.Status), c.Representative.URL, o.Grey(fmt.Sprintf("len=%-6d", c.Representative.Length)), reasonStyle(o, c.Representative.Status, c.Representative.Reason), tag)
 	}
 	WriteSecuritySummary(w, r.SecurityFindings)
 }
@@ -146,34 +149,31 @@ func WriteSecuritySummary(w io.Writer, findings []discover.SecurityFinding) {
 	})
 
 	sorted = CleanFindings(sorted)
-	fmt.Fprintf(w, "\n[security] %d finding(s):\n", len(sorted))
+	o := style.Out
+	fmt.Fprintf(w, "\n%s %s\n", o.Section("security"), o.Bold(fmt.Sprintf("%d finding(s):", len(sorted))))
 	for _, f := range sorted {
-		fmt.Fprintf(w, "  [%s] %s  %s\n", severityLabel(f.Severity), f.Type, f.URL)
+		fmt.Fprintf(w, "  %s %s  %s\n", o.Severity(f.Severity), o.Bold(f.Type), f.URL)
 		fmt.Fprintf(w, "        %s\n", f.Description)
 		if f.Evidence != "" {
 			ev := f.Evidence
 			if len(ev) > 100 {
 				ev = ev[:97] + "..."
 			}
-			fmt.Fprintf(w, "        evidence: %s\n", ev)
+			fmt.Fprintf(w, "        %s %s\n", o.Grey("evidence:"), o.Cyan(ev))
 		}
 	}
 }
 
-// severityLabel returns an uppercased, fixed-width severity label for
-// consistent terminal alignment ("HIGH  " vs "LOW   " etc).
-func severityLabel(s string) string {
-	switch s {
-	case "high":
-		return "HIGH  "
-	case "medium":
-		return "MEDIUM"
-	case "low":
-		return "LOW   "
-	case "info":
-		return "INFO  "
+// reasonStyle tints a finding's explanation to match its status: server
+// errors red, protected paths yellow, everything else unchanged.
+func reasonStyle(o style.Palette, status int, reason string) string {
+	switch {
+	case status >= 500:
+		return o.Red(reason)
+	case status == 401 || status == 403:
+		return o.Yellow(reason)
 	}
-	return s
+	return reason
 }
 
 // urlLess orders URLs shortest first, then alphabetically.
