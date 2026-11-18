@@ -2,6 +2,7 @@ package wordlist
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -54,5 +55,18 @@ func TestMergeDeduplicates(t *testing.T) {
 	want := []string{"admin", "api", "health"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestFromJSFindsRouterPathsWithoutLeadingSlash(t *testing.T) {
+	src := []byte(`const routes=[{path:"score-board",component:A},{path:'administration',component:B},{path:"search/:q"},{path:"**"},{ path : "about" }]`)
+	got := strings.Join(FromJS(src), ",")
+	for _, want := range []string{"/score-board", "/administration", "/about"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("FromJS missed route %s: %s", want, got)
+		}
+	}
+	if strings.Contains(got, ":q") || strings.Contains(got, "**") {
+		t.Errorf("parameterised or wildcard route leaked into candidates: %s", got)
 	}
 }

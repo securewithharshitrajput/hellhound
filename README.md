@@ -67,10 +67,10 @@ flowchart LR
 ## Install
 
 ```bash
-go install github.com/securewithharshitrajput/hellhound/cmd/hellhound@v0.9.0
+go install github.com/securewithharshitrajput/hellhound/cmd/hellhound@v0.9.1
 ```
 
-(Pin to a tagged version like `@v0.9.0` rather than `@latest` — Go's module proxy caches version lookups, and `@latest` against an untagged commit can serve a stale result until the proxy's cache naturally refreshes. A tagged release doesn't have that problem.)
+(Pin to a tagged version like `@v0.9.1` rather than `@latest` — Go's module proxy caches version lookups, and `@latest` against an untagged commit can serve a stale result until the proxy's cache naturally refreshes. A tagged release doesn't have that problem.)
 
 This drops a `hellhound` binary into `$(go env GOBIN)` (usually `~/go/bin`) — the same place `ffuf`/`katana` live. Make sure that's on your `PATH` and you're done:
 
@@ -219,10 +219,11 @@ Hellhound classifies each endpoint it discovers against a dedicated set of secur
 | Check | What it looks for | Typical severity |
 |---|---|---|
 | **sensitive-file** | `.env`, `.git/config`, `.htpasswd`, `backup.sql`, `/id_rsa`, `wp-config.php.bak`, Terraform state, `/credentials.json`, 40+ well-known dangerous paths — each confirmed by content markers (no soft-404 false positives) | HIGH |
-| **dir-listing** | Response body matches Apache/nginx/Python-SimpleHTTPServer's directory-index fingerprint — every filename enumerable, non-linked backups exposed | MEDIUM |
+| **dir-listing** | Response body matches the directory-index fingerprint of Apache, nginx, Python and Express (`serve-index`) — every filename enumerable, non-linked backups exposed | MEDIUM |
 | **dangerous-methods** | `OPTIONS` on each discovered endpoint; flags any `Allow:` header advertising `PUT` / `DELETE` / `PATCH` (MEDIUM) or `TRACE` alone (LOW, XST primitive) | MEDIUM / LOW |
 | **open-redirect** | Any discovered URL whose query carries a redirect-shaped parameter (`url`, `next`, `redirect`, `redirect_uri`, `goto`, `return`, `callback`, …) is re-sent with a canary external URL; a 3xx `Location:` reflecting it is flagged | MEDIUM |
 | **exposed-copy** | A discovered `/test/`, `/staging/`, `/old/`, `/backup/`, `/dev/`… that serves a public HTML site. MEDIUM when its `<title>` matches the live homepage (a full copy of the site, usually running older code), LOW otherwise | MEDIUM / LOW |
+| **monitoring / debug endpoints** | `/metrics` (Prometheus), `/actuator/env` and `/actuator/heapdump` (Spring Boot), `/server-status`, `/server-info`, `/phpinfo.php` — each confirmed by content, not just a `200` | MEDIUM / HIGH |
 | **info-disclosure** | `Server`, `X-Powered-By`, `X-AspNet-Version`, `X-Rails-Version`, `X-Generator`, `X-Application-Context`, etc. — deduplicated per host so a 10,000-request scan doesn't flood with the same banner | LOW / INFO |
 
 These checks are built to stay quiet on targets that answer `200` for everything (single-page apps, WAF block pages, catch-all routers):

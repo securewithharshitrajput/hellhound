@@ -265,3 +265,29 @@ func TestMiningCollectsHomepageLinks(t *testing.T) {
 		t.Errorf("HomeLinks = %q, want /courses,/termsofuse/ (same-site links only, no root)", got)
 	}
 }
+
+func TestDetectDirListingExpressServeIndex(t *testing.T) {
+	body := []byte(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>listing directory /ftp</title></head><body><ul id="files" class="view-tiles"><li><a href="/ftp/acquisitions.md">acquisitions.md</a></li></ul></body></html>`)
+	if _, ok := DetectDirListing(body); !ok {
+		t.Error("Express serve-index listing not detected")
+	}
+	if _, ok := DetectDirListing([]byte(`<html><head><title>Docs: how listing directories works</title></head></html>`)); ok {
+		t.Error("ordinary page mentioning directories wrongly detected as a listing")
+	}
+}
+
+func TestMetricsAndMonitoringProbes(t *testing.T) {
+	probes := map[string]sensitiveProbe{}
+	for _, p := range sensitiveTargets {
+		probes[p.Path] = p
+	}
+	if _, ok := probes["/metrics"].Match([]byte("# HELP http_requests_total The total.\n# TYPE http_requests_total counter\nhttp_requests_total 3\n")); !ok {
+		t.Error("Prometheus metrics not recognised")
+	}
+	if _, ok := probes["/metrics"].Match([]byte("<html><body>Metrics dashboard coming soon</body></html>")); ok {
+		t.Error("HTML page wrongly recognised as Prometheus metrics")
+	}
+	if _, ok := probes["/server-status"].Match([]byte("<html><head><title>Apache Status</title></head><h1>Apache Server Status for example.com</h1>")); !ok {
+		t.Error("Apache server-status not recognised")
+	}
+}

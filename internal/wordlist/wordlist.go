@@ -22,6 +22,43 @@ var Seed = []string{
 	"actuator", "swagger", "swagger.json", "openapi.json", "graphql",
 	".git/config", ".env", ".env.local", "robots.txt", "sitemap.xml",
 	"package.json", "web.config", "server-status", ".well-known/security.txt",
+
+	// APIs and documentation
+	"api-docs", "api/v1", "api/v2", "v1", "v2", "rest", "docs", "documentation",
+	"swagger-ui", "swagger-ui.html", "swagger/index.html", "redoc", "graphiql",
+	"playground", "altair", "api/docs", "api/swagger.json", "swagger.yaml",
+	// Sensitive-sounding directories
+	"encryptionkeys", "keys", "secret", "secrets", "logs", "log", "support",
+	"support/logs", "ftp", "files", "file", "download", "downloads", "backups",
+	"bak", "db", "database", "dump", "sql", "data", "export", "import",
+	"archive", "archives", "new", "temp", "cache", "storage", "public",
+	"media", "images", "img", "js", "css", "scripts", "src", "source", "dist",
+	"build", "out", "target", "coverage", "reports", "report", "stats",
+	"analytics", "samples", "example", "examples", "tests",
+	// Admin and management
+	"administrator", "administration", "admin.php", "adminer", "adminer.php",
+	"phpmyadmin", "pma", "cpanel", "manager", "management", "panel", "portal",
+	"console", "h2-console", "jenkins", "gitlab", "grafana", "kibana",
+	"prometheus", "jolokia", "jmx", "trace", "traces", "env", "info",
+	"phpinfo.php", "info.php", "server-info", "actuator/env",
+	"actuator/heapdump", "healthz", "readyz", "ping", "version",
+	// Accounts and auth
+	"login.php", "logout", "signin", "signup", "register", "auth", "oauth",
+	"sso", "token", "tokens", "user", "users", "account", "accounts",
+	"profile", "settings", "setup", "install", "installer", "upgrade",
+	"update", "maintenance",
+	// Environments
+	"stage", "uat", "qa", "demo", "beta", "sandbox", "preview", "intranet",
+	"mail", "webmail",
+	// Config, source and backup files
+	"config.json", "config.php", "configuration", "conf", "settings.json",
+	"docker-compose.yml", "Dockerfile", ".dockerignore", ".gitignore",
+	".htaccess", ".htpasswd", ".DS_Store", "id_rsa", "backup.zip",
+	"backup.sql", "db.sql", "dump.sql", "site.zip", "www.zip", "README.md",
+	"CHANGELOG.md", "composer.json", "crossdomain.xml", "humans.txt",
+	"security.txt", "manifest.json", "service-worker.js", "cgi-bin", "bin",
+	"lib", "vendor", "node_modules", "wp-admin", "wp-login.php", "wp-content",
+	"wp-json", "xmlrpc.php", "elmah.axd", "trace.axd", "error", "errors",
 }
 
 // FrameworkPaths are probed opportunistically based on fingerprinted
@@ -58,8 +95,21 @@ func FromJS(src []byte) []string {
 			out = append(out, p)
 		}
 	}
+	// Router definitions (Angular, React Router, Vue Router) name routes
+	// without a leading slash: path:"administration", path: 'score-board'.
+	for _, m := range routeDefRe.FindAllSubmatch(src, -1) {
+		p := "/" + string(m[1])
+		if looksLikeRoute(p) {
+			out = append(out, p)
+		}
+	}
 	return out
 }
+
+// routeDefRe finds router path definitions such as path:"score-board".
+// Parameterised segments (":id") and wildcards are left out by the character
+// class; they are not paths that can be requested.
+var routeDefRe = regexp.MustCompile(`\bpath\s*:\s*["']([a-zA-Z0-9_\-][a-zA-Z0-9_\-/]{1,60})["']`)
 
 // FromRobots extracts Disallow/Allow paths from a robots.txt body — these
 // are a goldmine: the site owner is explicitly telling you what exists and

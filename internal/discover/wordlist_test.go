@@ -111,7 +111,10 @@ func TestResolveScriptURLSkipsCrossOrigin(t *testing.T) {
 		{"/static/app.js", "http://target.tld/static/app.js"},
 		{"https://cdn.example.com/react.js", ""},
 		{"//cdn.example.com/react.js", ""},
-		{"app.js", ""}, // page-relative, deliberately not guessed at
+		{"app.js", "http://target.tld/app.js"}, // page-relative: resolved against the homepage
+		{"./main.js", "http://target.tld/main.js"},
+		{"../up.js", ""},
+		{"javascript:void(0)", ""},
 	}
 	for _, c := range cases {
 		if got := resolveScriptURL(base, c.src); got != c.want {

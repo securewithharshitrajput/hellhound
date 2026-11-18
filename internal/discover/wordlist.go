@@ -205,8 +205,14 @@ func resolveScriptURL(baseURL, src string) string {
 		return ""
 	case strings.HasPrefix(src, "/"):
 		return baseURL + src
+	case strings.HasPrefix(src, "../"), strings.Contains(src, ":"):
+		return "" // climbs out of the start page's directory, or another scheme
 	default:
-		return ""
+		// Only the homepage is ever mined, and its address is known, so a
+		// page-relative "main.js" (Angular and many SPA builds write scripts
+		// this way) resolves to a definite URL. Skipping them left such
+		// sites with no mined words at all.
+		return baseURL + "/" + strings.TrimPrefix(src, "./")
 	}
 }
 

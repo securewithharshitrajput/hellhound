@@ -14,7 +14,7 @@ import "regexp"
 // anchored to the <title>/<h1> element (or the IIS link text) because looser
 // markers such as "[DIR]" or a "Last modified" column also appear on
 // ordinary documentation and changelog pages.
-var dirListingRe = regexp.MustCompile(`(?i)<(?:title|h1)>\s*(?:Index of|Directory listing for)\s+/[^<]*</(?:title|h1)>|\[To Parent Directory\]</a>`)
+var dirListingRe = regexp.MustCompile(`(?i)<(?:title|h1)>\s*(?:Index of|Directory listing for|listing directory)\s+/[^<]*</(?:title|h1)>|\[To Parent Directory\]</a>`)
 
 // ClassifyDirListings scans the Results' BodyPreview fields and promotes
 // those matching a directory-listing fingerprint into a dedicated

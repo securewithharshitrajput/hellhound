@@ -21,7 +21,7 @@ import (
 
 // Version is the tool's displayed version. Bump this on meaningful
 // feature changes.
-const Version = "0.9.0"
+const Version = "0.9.1"
 
 // Tagline appears under the logo and in the no-TTY fallback line.
 const Tagline = "calibrated recon that classifies what it finds"

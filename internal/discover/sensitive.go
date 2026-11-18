@@ -173,6 +173,14 @@ var sensitiveTargets = []sensitiveProbe{
 	{"/application.yml", re(`(?m)^spring:|^\s+datasource:`), "medium", "Spring application.yml may contain credentials"},
 	{"/application.properties", re(`(?m)^spring\.[A-Za-z0-9_.\-]+\s*=`), "medium", "Spring application.properties may contain credentials"},
 
+	// Monitoring and debug endpoints left open to the internet
+	{"/metrics", allLit("# HELP ", "# TYPE "), "medium", "Prometheus metrics are publicly readable — they reveal internal routes, request volumes, versions and process details"},
+	{"/actuator/env", jsonWith(anyLit(`"propertySources"`, `"activeProfiles"`)), "high", "Spring Boot actuator /env exposes configuration and may expose secrets"},
+	{"/actuator/heapdump", prefix("JAVA PROFILE"), "high", "Spring Boot heap dump exposed — it can contain credentials and session tokens in memory"},
+	{"/server-status", allLit("Apache Server Status"), "medium", "Apache mod_status is public — it shows live requests, client addresses and URLs"},
+	{"/server-info", allLit("Apache Server Information"), "medium", "Apache mod_info is public — it shows server configuration"},
+	{"/phpinfo.php", anyLit("<title>phpinfo()", "PHP Version "), "medium", "phpinfo() page exposes PHP configuration, paths and environment variables"},
+
 	// Private keys
 	{"/id_rsa", privateKey, "high", "SSH private key exposed"},
 	{"/.ssh/id_rsa", privateKey, "high", "SSH private key exposed"},
