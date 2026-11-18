@@ -67,10 +67,10 @@ flowchart LR
 ## Install
 
 ```bash
-go install github.com/securewithharshitrajput/hellhound/cmd/hellhound@v0.9.1
+go install github.com/securewithharshitrajput/hellhound/cmd/hellhound@v0.10.0
 ```
 
-(Pin to a tagged version like `@v0.9.1` rather than `@latest` — Go's module proxy caches version lookups, and `@latest` against an untagged commit can serve a stale result until the proxy's cache naturally refreshes. A tagged release doesn't have that problem.)
+(Pin to a tagged version like `@v0.10.0` rather than `@latest` — Go's module proxy caches version lookups, and `@latest` against an untagged commit can serve a stale result until the proxy's cache naturally refreshes. A tagged release doesn't have that problem.)
 
 This drops a `hellhound` binary into `$(go env GOBIN)` (usually `~/go/bin`) — the same place `ffuf`/`katana` live. Make sure that's on your `PATH` and you're done:
 
@@ -207,6 +207,10 @@ The banner at the top is randomized per run (Metasploit-style rotating tips) and
 | `-no-progress` | `false` | Do not draw the live progress line (it is only drawn on a terminal) |
 | `-max-time` | `0` | Stop discovery (mining, crawl, fuzzing) after this long, e.g. `10m`, then still run the security checks and report; `0` = no limit |
 | `-crawl-similar` | `5` | Follow at most this many links per URL pattern (`/products/{id}`, `/blog/{id}`…); `0` = unlimited |
+| `-fw` | — | Never report responses with exactly this many words: `-fw 12,3000` |
+| `-fl` | — | Never report responses with exactly this many lines: `-fl 1,57` |
+| `-fr` | — | Never report responses whose body matches this regex: `-fr "Access denied"`. Wins over `-mr` |
+| `-mr` | — | Always report responses whose body matches this regex, even when calibration judged them to be the not-found page |
 | `-show-assets` | `false` | List every static asset found by `-crawl` instead of one summary line |
 | `-show-known` | `false` | Also list hits that are pages the site already publishes (sitemap, crawled links, homepage assets, `robots.txt`); by default only discoveries are listed |
 | `-no-auto-throttle` | `false` | Do not slow down automatically when the target starts timing out |
@@ -323,6 +327,20 @@ Precedence: profile < config file < command line.
 | `quick` | root directory only, 60 workers |
 | `deep` | depth 4, crawling to depth 5 (2000 pages), 8 calibration probes |
 | `gentle` | 4 workers, 8 requests/sec, depth 1, 20s timeout — for fragile or production targets |
+
+## Crawling
+
+`-crawl` follows the target's own links to find pages no wordlist could ever guess — a random slug, a numeric id, an internal report path. It reads far more than `<a href>`:
+
+- `<a>`, `<link>`, `<script src>`, `<img src>`/`srcset`, `<form action>`, `formaction`, `<base href>`, `hx-get`/`hx-post`/`hx-put`/`hx-patch`
+- `<meta http-equiv="refresh">` and the response's own `Link`, `Refresh` and `Content-Location` headers
+- A redirect's `Location` target is followed as a discovery in its own right (a `/old` → `/login` redirect surfaces `/login`)
+- Every fetched `.js`/`.css` file and every inline `<script>` block is scraped for same-origin endpoints (`fetch("/api/users")`, `"/rest/admin"`) — this is how hellhound found Juice Shop's `/api/Users`, `/rest/admin` and `/rest/user/login` with no wordlist involved at all, entries no wordlist would guess
+- Forms are described (method, action, fields, password/file/CSRF-token presence) but **never submitted**; a login form, an upload form, or a password form posting over plain HTTP each become a finding
+
+Duplicate content is collapsed, not just duplicate URLs: some dev servers (confirmed live against Juice Shop) serve the identical JS/CSS bundle under any nested path that happens to end in that filename (`/main.js`, `/section/main.js`, `/section/edit/main.js` — all byte-identical). hellhound fingerprints each static asset's body and reports/scrapes an exact repeat only once, so one relative `<script src="main.js">` on a deep page can't manufacture a cascade of fake "new pages".
+
+`-crawl-similar N` (default 5) caps how many links sharing one URL *pattern* are followed — `/products/{id}`, `/blog/post-{slug}-{id}`, `/archive/{date}` — so a 10,000-product catalogue contributes a handful of fuzz words instead of fetching every product page.
 
 ## Rendering
 

@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -84,6 +85,10 @@ func main() {
 		matchCodes   = flag.String("mc", "", "always report these status codes, even when calibration judged them to be the not-found page (e.g. 401,403 or 500-599)")
 		filterCodes  = flag.String("fc", "", "never report these status codes (e.g. 404,418 or 300-399); wins over -mc")
 		filterSizes  = flag.String("fs", "", "never report responses whose body is exactly this many bytes (e.g. 0,1234)")
+		filterWords  = flag.String("fw", "", "never report responses with exactly this many words (e.g. 12,3000)")
+		filterLines  = flag.String("fl", "", "never report responses with exactly this many lines (e.g. 1,57)")
+		filterRegex  = flag.String("fr", "", "never report responses whose body matches this regular expression (e.g. 'Access denied')")
+		matchRegex   = flag.String("mr", "", "always report responses whose body matches this regular expression, even when calibration judged them to be the not-found page")
 		scopeFile    = flag.String("scope", "", "scope file: hosts/paths the scan may touch and '!' exclusions; enforced on every request (see README)")
 		resumeFile   = flag.String("resume", "", "state file: saved after every completed directory; if it already exists the scan continues from it instead of starting over")
 		noProgress   = flag.Bool("no-progress", false, "do not draw the live progress line (it is only drawn on a terminal anyway)")
@@ -139,7 +144,8 @@ func main() {
 	if err == nil {
 		err = checkWritable(*jsonOut, *csvOut, *sarifOut)
 	}
-	var mcSet, fcSet, fsSet map[int]bool
+	var mcSet, fcSet, fsSet, fwSet, flSet map[int]bool
+	var frRe, mrRe *regexp.Regexp
 	if err == nil {
 		mcSet, err = parseIntSet("-mc", *matchCodes, 100, 599)
 	}
@@ -148,6 +154,22 @@ func main() {
 	}
 	if err == nil {
 		fsSet, err = parseIntSet("-fs", *filterSizes, 0, 1<<31-1)
+	}
+	if err == nil {
+		fwSet, err = parseIntSet("-fw", *filterWords, 0, 1<<31-1)
+	}
+	if err == nil {
+		flSet, err = parseIntSet("-fl", *filterLines, 0, 1<<31-1)
+	}
+	if err == nil && *filterRegex != "" {
+		if frRe, err = regexp.Compile(*filterRegex); err != nil {
+			err = fmt.Errorf("-fr: invalid regular expression: %v", err)
+		}
+	}
+	if err == nil && *matchRegex != "" {
+		if mrRe, err = regexp.Compile(*matchRegex); err != nil {
+			err = fmt.Errorf("-mr: invalid regular expression: %v", err)
+		}
 	}
 	var sc *scope.Scope
 	if err == nil && *scopeFile != "" {
@@ -334,11 +356,12 @@ func main() {
 	// because a crawl-found page's segments are now fuzzed, those pages also
 	// land in the structured report/output files, not just the [crawl] text.
 	var crawlResults []discover.CrawlResult
+	var crawlForms []discover.Form
 	if state != nil {
 		crawlResults = state.Crawl
 	}
 	if scanCtx.Err() == nil && *crawl {
-		crawlResults = runCrawl(scanCtx, eng, baseURL, *crawlDepth, *crawlMax, *crawlSimilar, *showAssets, renderer)
+		crawlResults, crawlForms = runCrawl(scanCtx, eng, baseURL, *crawlDepth, *crawlMax, *crawlSimilar, *showAssets, renderer)
 		if cw := discover.WordsFromCrawl(crawlResults); len(cw) > 0 {
 			before := len(words)
 			prev := words
@@ -389,6 +412,10 @@ func main() {
 		MatchCodes:   mcSet,
 		FilterCodes:  fcSet,
 		FilterSizes:  fsSet,
+		FilterWords:  fwSet,
+		FilterLines:  flSet,
+		FilterRegex:  frRe,
+		MatchRegex:   mrRe,
 		Expected:     expected,
 		Home:         discover.SnapshotHome(pre[0]),
 		OnProgress:   prog.Update,
@@ -481,7 +508,9 @@ func main() {
 	if !*noSecurity {
 		allResults := append([]discover.Result{}, results...)
 		allResults = append(allResults, discover.AsResults(crawlResults)...)
-		rep.SecurityFindings = report.CleanFindings(runSecurityScans(ctx, eng, baseURL, allResults, rootSens, interrupted))
+		found := runSecurityScans(ctx, eng, baseURL, allResults, rootSens, interrupted)
+		found = append(found, discover.ClassifyForms(crawlForms)...)
+		rep.SecurityFindings = report.CleanFindings(found)
 	}
 
 	report.WriteSummary(os.Stdout, rep)
@@ -861,7 +890,7 @@ func runVHostScan(ctx context.Context, eng *engine.Engine, baseURL, vhostFile st
 // runCrawl follows real links from the target to surface pages no wordlist
 // could guess — the one job a pure fuzzer structurally can't do, and the
 // gap this closes versus katana.
-func runCrawl(ctx context.Context, eng *engine.Engine, baseURL string, depth, maxPages, maxSimilar int, showAssets bool, render discover.Renderer) []discover.CrawlResult {
+func runCrawl(ctx context.Context, eng *engine.Engine, baseURL string, depth, maxPages, maxSimilar int, showAssets bool, render discover.Renderer) ([]discover.CrawlResult, []discover.Form) {
 	start := time.Now()
 	fmt.Fprintf(os.Stderr, "\nhellhound: crawling %s for linked pages (max depth %d, max %d pages)...\n", baseURL, depth, maxPages)
 	renderErrs := 0
@@ -917,8 +946,35 @@ func runCrawl(ctx context.Context, eng *engine.Engine, baseURL string, depth, ma
 			}
 		}
 	}
+	printForms(stats.Forms)
 	fmt.Fprintf(os.Stderr, "hellhound: crawl done in %s\n", time.Since(start).Round(time.Millisecond))
-	return results
+	return results, stats.Forms
+}
+
+// printForms lists the forms the crawl saw. They are only described: a form
+// is never submitted.
+func printForms(forms []discover.Form) {
+	if len(forms) == 0 {
+		return
+	}
+	fmt.Printf("\n[forms] %d form(s) found (listed only, never submitted):\n", len(forms))
+	for _, f := range forms {
+		var tags []string
+		if f.HasPassword {
+			tags = append(tags, "password")
+		}
+		if f.HasFile {
+			tags = append(tags, "file upload")
+		}
+		if f.Method == "POST" && !f.HasToken {
+			tags = append(tags, "no CSRF-style field")
+		}
+		extra := ""
+		if len(tags) > 0 {
+			extra = "  [" + strings.Join(tags, ", ") + "]"
+		}
+		fmt.Printf("    %-4s %s  fields: %s%s\n", f.Method, report.Clean(f.Action), report.Clean(strings.Join(f.Fields, ", ")), extra)
+	}
 }
 
 // assetKind classifies a static asset URL by extension ("" for pages).

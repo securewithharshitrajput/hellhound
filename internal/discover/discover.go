@@ -8,6 +8,7 @@ package discover
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/securewithharshitrajput/hellhound/internal/analyze"
@@ -36,6 +37,15 @@ type Options struct {
 	MatchCodes  map[int]bool
 	FilterCodes map[int]bool
 	FilterSizes map[int]bool
+	// FilterWords / FilterLines hide responses with exactly this many words
+	// / lines (ffuf's -fw / -fl); FilterRegex hides responses whose body
+	// matches (-fr). MatchRegex reports a response whose body matches even
+	// when calibration judged it to be the not-found page (-mr). Filters
+	// win over matches.
+	FilterWords map[int]bool
+	FilterLines map[int]bool
+	FilterRegex *regexp.Regexp
+	MatchRegex  *regexp.Regexp
 
 	// Expected lists wordlist entries taken from the target itself (its
 	// sitemap, robots.txt, crawled links). They are SUPPOSED to exist, so
@@ -276,8 +286,24 @@ func (d *Discoverer) judge(dir, path string, resp engine.Response) (v analyze.Ve
 		v.Interesting, v.Reason = false, fmt.Sprintf("size %d hidden by -fs", resp.Length)
 		return v, false
 	}
+	if d.opts.FilterWords[resp.Words] {
+		v.Interesting, v.Reason = false, fmt.Sprintf("%d words hidden by -fw", resp.Words)
+		return v, false
+	}
+	if d.opts.FilterLines[resp.Lines] {
+		v.Interesting, v.Reason = false, fmt.Sprintf("%d lines hidden by -fl", resp.Lines)
+		return v, false
+	}
+	if d.opts.FilterRegex != nil && d.opts.FilterRegex.Match(resp.Body) {
+		v.Interesting, v.Reason = false, "body hidden by -fr"
+		return v, false
+	}
 	if !v.Interesting && d.opts.MatchCodes[resp.Status] {
 		v.Interesting, v.Reason = true, fmt.Sprintf("status %d shown because of -mc (calibration: %s)", resp.Status, v.Reason)
+		return v, true
+	}
+	if !v.Interesting && d.opts.MatchRegex != nil && resp.Status != 404 && d.opts.MatchRegex.Match(resp.Body) {
+		v.Interesting, v.Reason = true, fmt.Sprintf("body matches -mr (calibration: %s)", v.Reason)
 		return v, true
 	}
 	return v, false

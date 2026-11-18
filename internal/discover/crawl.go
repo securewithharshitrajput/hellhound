@@ -8,6 +8,8 @@ package discover
 
 import (
 	"context"
+	"fmt"
+	"hash/fnv"
 	"html"
 	"net/url"
 	"regexp"
@@ -18,12 +20,21 @@ import (
 	"github.com/securewithharshitrajput/hellhound/internal/engine"
 )
 
+// fnv64a is a cheap, non-cryptographic content fingerprint — good enough to
+// recognise an exact-duplicate response body during one crawl run; it is
+// never used for anything security-relevant.
+func fnv64a(b []byte) uint64 {
+	h := fnv.New64a()
+	h.Write(b)
+	return h.Sum64()
+}
+
 // linkAttrRe pulls URL-valued attributes (href, src, action) out of raw
 // HTML. A regex rather than a full HTML parser keeps the project
 // dependency-free and matches the existing extraction style (scriptSrcRe,
 // the wordlist miner); for link DISCOVERY the occasional malformed match
 // is harmless — it just gets scope-filtered and deduped away downstream.
-var linkAttrRe = regexp.MustCompile(`(?i)(?:href|src|action)\s*=\s*["']([^"'<>]+)["']`)
+var linkAttrRe = regexp.MustCompile(`(?i)(?:href|src|action|formaction|poster|cite|background|data|data-src|data-href|data-url|hx-get|hx-post|hx-put|hx-patch)\s*=\s*["']([^"'<>]+)["']`)
 
 // CrawlResult is one URL reached by following real links, with the HTTP
 // status it returned and the link-depth at which it was discovered.
@@ -104,6 +115,9 @@ type CrawlStats struct {
 	// Capped maps a URL pattern to the number of links matching it that
 	// were not followed because of MaxSimilar.
 	Capped map[string]int
+	// Forms are the distinct forms seen on crawled pages (described, never
+	// submitted).
+	Forms []Form
 }
 
 // CrawlOpts is the full-featured crawl; Crawl and CrawlWith wrap it.
@@ -127,6 +141,8 @@ func CrawlOpts(ctx context.Context, eng *engine.Engine, target string, cfg Crawl
 		depth int
 	}
 	seen := map[string]bool{}
+	seenForms := map[string]bool{}
+	seenAssetBody := map[string]bool{}
 	var results []CrawlResult
 
 	start := *base
@@ -180,6 +196,24 @@ func CrawlOpts(ctx context.Context, eng *engine.Engine, target string, cfg Crawl
 			if resp.Status == 404 || resp.Status == 410 {
 				continue
 			}
+			// Some dev servers (confirmed live against Juice Shop) serve the
+			// SAME static asset body for any nested path that happens to end
+			// in that filename: /main.js, /address/main.js and
+			// /address/edit/main.js all return byte-identical JS. Each such
+			// path is "discovered" by the previous page's own relative
+			// <script src="main.js">, so without this check the crawl keeps
+			// re-finding, re-reporting and re-scraping the same bundle under
+			// one new path per directory depth — noise, not new pages, and
+			// wasted requests scraping the same JS for endpoints over and
+			// over. A byte-identical body under a static-asset extension is
+			// reported and processed only the first time it is seen.
+			if IsStaticAsset(it.u.Path) && len(resp.Body) > 0 {
+				key := fmt.Sprintf("%d:%x", len(resp.Body), fnv64a(resp.Body))
+				if seenAssetBody[key] {
+					continue
+				}
+				seenAssetBody[key] = true
+			}
 			if it.depth > 0 { // never report the start page as a "finding"
 				results = append(results, CrawlResult{
 					URL:         it.u.String(),
@@ -192,16 +226,55 @@ func CrawlOpts(ctx context.Context, eng *engine.Engine, target string, cfg Crawl
 			if it.depth >= maxDepth {
 				continue
 			}
-			// Only parse genuine 2xx HTML for more links — a redirect,
-			// error, or non-HTML asset has no navigable links worth
-			// following (and parsing a binary body for "href=" is noise).
-			if resp.Status < 200 || resp.Status >= 300 {
-				continue
+			// Where this response points. A redirect target is itself a
+			// discovery (a login page, a canonical URL); HTML contributes its
+			// links, forms and inline-script endpoints; JavaScript and CSS
+			// contribute the endpoints written in them; headers (Link,
+			// Refresh, Content-Location) contribute the rest. Error pages and
+			// binary bodies contribute nothing.
+			var raws []string
+			switch {
+			case resp.Status >= 300 && resp.Status < 400:
+				if resp.RedirectTo != "" {
+					raws = append(raws, resp.RedirectTo)
+				}
+			case resp.Status >= 200 && resp.Status < 300:
+				ct := strings.ToLower(resp.Header.Get("Content-Type"))
+				lowerPath := strings.ToLower(it.u.Path)
+				switch {
+				case ct == "" || strings.Contains(ct, "html"):
+					rel := it.u // what relative links resolve against
+					if b := baseHref(resp.Body); b != "" {
+						if bu, err := it.u.Parse(b); err == nil {
+							rel = bu
+						}
+					}
+					var links []string
+					links = append(links, extractLinks(resp.Body)...)
+					links = append(links, extractLinks(rendered[i])...)
+					links = append(links, srcsetLinks(resp.Body)...)
+					links = append(links, metaRefreshLinks(resp.Body)...)
+					for _, raw := range links {
+						if abs := absoluteAgainst(rel, raw); abs != "" {
+							raws = append(raws, abs)
+						}
+					}
+					raws = append(raws, inlineScriptEndpoints(resp.Body)...)
+					for _, src := range [][]byte{resp.Body, rendered[i]} {
+						for _, f := range ExtractForms(src, it.u) {
+							if k := formKey(f); !seenForms[k] {
+								seenForms[k] = true
+								stats.Forms = append(stats.Forms, f)
+								raws = append(raws, f.Action)
+							}
+						}
+					}
+				case strings.Contains(ct, "javascript") || strings.HasSuffix(lowerPath, ".js") || strings.HasSuffix(lowerPath, ".mjs"):
+					raws = append(raws, jsEndpoints(resp.Body)...)
+				}
+				raws = append(raws, headerLinks(resp.Header)...)
 			}
-			if ct := strings.ToLower(resp.Header.Get("Content-Type")); ct != "" && !strings.Contains(ct, "html") {
-				continue
-			}
-			for _, raw := range append(extractLinks(resp.Body), extractLinks(rendered[i])...) {
+			for _, raw := range raws {
 				abs := resolveInScope(it.u, raw, base.Host)
 				if abs == nil {
 					continue
@@ -237,6 +310,8 @@ func URLPattern(u *url.URL) string {
 	for i, sg := range segs {
 		if isIDSegment(sg) {
 			segs[i] = "{id}"
+		} else if isSlugID(sg) {
+			segs[i] = "{slug}-{id}"
 		}
 	}
 	p := strings.Join(segs, "/")
@@ -256,32 +331,65 @@ func URLPattern(u *url.URL) string {
 }
 
 // isIDSegment reports whether a path segment looks like an identifier
-// rather than a word: all digits, a UUID, or a hex string of 8+ characters
-// (MongoDB ObjectIDs, hashes).
+// rather than a word: all digits (record numbers, timestamps), a UUID, a
+// date, or a hex string of 8+ characters containing a digit (MongoDB
+// ObjectIDs, hashes). The digit requirement keeps a plain English word
+// that happens to be spelled with a-f only from being taken for a hash.
 func isIDSegment(s string) bool {
 	if s == "" {
 		return false
 	}
-	digits, hex := true, len(s) >= 8
+	digits, hex, hasDigit := true, len(s) >= 8, false
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		isD := c >= '0' && c <= '9'
 		isH := isD || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
-		if !isD {
+		if isD {
+			hasDigit = true
+		} else {
 			digits = false
 		}
 		if !isH {
 			hex = false
 		}
 	}
-	if digits || hex {
+	if digits || (hex && hasDigit) {
 		return true
 	}
 	// 8-4-4-4-12 UUID
 	if len(s) == 36 && s[8] == '-' && s[13] == '-' && s[18] == '-' && s[23] == '-' {
 		return isIDSegment(strings.ReplaceAll(s, "-", ""))
 	}
+	// 2026-11-18
+	if len(s) == 10 && s[4] == '-' && s[7] == '-' && isIDSegment(s[:4]) && isIDSegment(s[5:7]) && isIDSegment(s[8:]) {
+		return true
+	}
 	return false
+}
+
+// isSlugID reports whether a segment is a readable slug ending in an id:
+// "Complete-Data-Science-6aac2df9c0c67432264be265", "post-12345". Sites
+// build these from a title plus a database id, so every item of a catalogue
+// has a different segment but is one kind of page.
+func isSlugID(s string) bool {
+	i := strings.LastIndexByte(s, '-')
+	if i <= 0 || i == len(s)-1 {
+		return false
+	}
+	tail := s[i+1:]
+	if len(tail) < 4 && !isAllDigits(tail) {
+		return false
+	}
+	return isIDSegment(tail) && (len(tail) >= 4)
+}
+
+func isAllDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return s != ""
 }
 
 // resolveInScope resolves a raw href/src value against the page it was
