@@ -86,6 +86,11 @@ type Request struct {
 	// effect on the wire at all, so without this field vhost fuzzing would
 	// silently do nothing.
 	HostOverride string
+	// Timeout, if set, shortens this request's timeout below the engine's
+	// (it can never lengthen it). A request that times out under its own
+	// short limit is an optional probe the server ignored, not a sign the
+	// target is struggling, so it does not feed auto-throttling.
+	Timeout time.Duration
 	// Meta rides along so callers can correlate responses with their intent
 	// (e.g. "this was a recursion probe for /admin").
 	Meta any
@@ -402,7 +407,7 @@ func (e *Engine) do(ctx context.Context, r Request) Response {
 	if resp.Err != nil && ctx.Err() == nil && isDroppedConnection(resp.Err) {
 		resp = e.once(ctx, r)
 	}
-	if resp.Err != nil && ctx.Err() == nil && e.cfg.AutoThrottle && isTimeout(resp.Err) {
+	if resp.Err != nil && ctx.Err() == nil && e.cfg.AutoThrottle && r.Timeout == 0 && isTimeout(resp.Err) {
 		e.noteTimeout()
 	}
 	// 429 is retried up to three times: after a pause every worker resumes
@@ -533,6 +538,11 @@ func (e *Engine) once(ctx context.Context, r Request) Response {
 	var bodyReader io.Reader
 	if len(r.Body) > 0 {
 		bodyReader = byteReader(r.Body)
+	}
+	if r.Timeout > 0 && r.Timeout < e.cfg.Timeout {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, r.Timeout)
+		defer cancel()
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, method, r.URL, bodyReader)
 	if err != nil {

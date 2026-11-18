@@ -250,3 +250,18 @@ func TestMiningReportsBlockedHomepage(t *testing.T) {
 		t.Errorf("Failed = %v, want homepage (403) listed", st.Failed)
 	}
 }
+
+func TestMiningCollectsHomepageLinks(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			page(w, 200, `<a href="/courses">c</a><a href="/termsofuse/">t</a><a href="https://other.example/x">o</a><a href="/">home</a>`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	_, st := BuildWordlistStats(context.Background(), testEngine(), srv.URL, nil)
+	if got := strings.Join(st.HomeLinks, ","); got != "/courses,/termsofuse/" {
+		t.Errorf("HomeLinks = %q, want /courses,/termsofuse/ (same-site links only, no root)", got)
+	}
+}

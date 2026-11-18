@@ -290,8 +290,12 @@ func main() {
 		var ms discover.MineStats
 		words, ms = discover.BuildWordlistStats(scanCtx, eng, baseURL, seed)
 		markExpected(seed, words)
-		for _, p := range ms.SitemapPaths {
-			known[knownKey(baseURL+p)] = true
+		origin := baseURL
+		if u, err := url.Parse(baseURL); err == nil {
+			origin = u.Scheme + "://" + u.Host
+		}
+		for _, p := range append(append([]string(nil), ms.SitemapPaths...), ms.HomeLinks...) {
+			known[knownKey(origin+p)] = true
 		}
 		if extra := len(words) - len(seed); extra > 0 {
 			fmt.Fprintf(os.Stderr, "hellhound: mined %d additional word(s) from the target itself\n", extra)
@@ -778,6 +782,10 @@ func runAPIDiscovery(ctx context.Context, eng *engine.Engine, baseURL string) {
 			URL:    baseURL + p,
 			Header: map[string]string{"Content-Type": "application/json"},
 			Body:   []byte(discover.GraphQLIntrospectionQuery),
+			// Many servers never answer a POST to a path they do not have.
+			// Waiting the full timeout for each of those wastes the run's
+			// last half minute and trips auto-throttle for no reason.
+			Timeout: 3 * time.Second,
 		})
 		kinds = append(kinds, probeGraphQL)
 		paths = append(paths, p)

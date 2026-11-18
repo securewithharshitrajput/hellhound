@@ -215,9 +215,20 @@ func (c *Calibrator) Classify(baseDir, path string, resp engine.Response) Verdic
 		return Verdict{Interesting: false, Reason: "rate limited (429) — the target did not answer for this path", ClusterKey: hash}
 	}
 
+	// A 404 or 410 is the definition of "not found": never a discovery on
+	// its own, whatever the calibrated baseline looks like. This matters
+	// when a site's not-found answer is a soft-200 (single-page apps, many
+	// Next.js sites): the baseline is then a 200 shape, so a genuine hard
+	// 404 for a truly-absent path looks "different from the baseline" and
+	// floods the report (seen live: /_next, /sitemap.xml reported as hits).
+	// -mc 404 can still surface them when an operator explicitly wants them.
+	if resp.Status == 404 || resp.Status == 410 {
+		return Verdict{Interesting: false, Reason: fmt.Sprintf("not found (%d)", resp.Status), ClusterKey: hash}
+	}
+
 	// Hard-404s with no baseline match are boring regardless of calibration.
 	if b == nil {
-		return Verdict{Interesting: resp.Status != 404, Reason: "no baseline (uncalibrated directory)", ClusterKey: hash}
+		return Verdict{Interesting: true, Reason: "no baseline (uncalibrated directory)", ClusterKey: hash}
 	}
 
 	// Note: we deliberately do NOT require resp.Length's size bucket to match

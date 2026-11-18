@@ -56,6 +56,9 @@ func BuildWordlist(ctx context.Context, eng *engine.Engine, baseURL string, seed
 type MineStats struct {
 	Failed       []string // e.g. "homepage (403)", "robots.txt (timeout)"
 	SitemapPaths []string
+	// HomeLinks are the same-site paths the homepage itself links to: pages
+	// the site publishes, so finding them by guessing is not a discovery.
+	HomeLinks []string
 }
 
 // BuildWordlistStats is BuildWordlist plus a report of what it could read.
@@ -117,6 +120,16 @@ func BuildWordlistStats(ctx context.Context, eng *engine.Engine, baseURL string,
 		// only adds the firewall's words.
 		st.Failed = append(st.Failed, fmt.Sprintf("homepage (%d)", home.Status))
 		return wordlist.Merge(seed, mined), st
+	}
+
+	if base, err := url.Parse(baseURL + "/"); err == nil {
+		seenLink := map[string]bool{}
+		for _, raw := range extractLinks(home.Body) {
+			if abs := resolveInScope(base, raw, base.Host); abs != nil && abs.Path != "" && abs.Path != "/" && !seenLink[abs.Path] {
+				seenLink[abs.Path] = true
+				st.HomeLinks = append(st.HomeLinks, abs.Path)
+			}
+		}
 	}
 
 	mined = append(mined, wordlist.PathToWords(wordlist.FromJS(home.Body))...)

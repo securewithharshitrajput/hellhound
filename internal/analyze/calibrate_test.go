@@ -345,3 +345,35 @@ func TestSlashNormalizationRedirectSuppressed(t *testing.T) {
 		t.Errorf("real /admin -> /login redirect should be reported, got suppressed: %q", v.Reason)
 	}
 }
+
+// A site whose not-found page is a soft 200 learns a 200 baseline. A genuine
+// hard 404 for an absent path must still never be a finding (seen live on a
+// Next.js site: /_next and /sitemap.xml reported as hits), while a server
+// error stays interesting.
+func TestHard404OnSoft404SiteIsNeverAFinding(t *testing.T) {
+	c := NewCalibrator()
+	probes := make([]Probe, 8)
+	for i := range probes {
+		tok := RandomToken()
+		resp, _ := softFake("/" + tok)
+		probes[i] = Probe{Token: tok, Resp: resp}
+	}
+	c.Learn("/", probes)
+
+	for _, status := range []int{404, 410} {
+		if v := c.Classify("/", "/sitemap.xml", fakeResp(status, []byte("<html>Page not found, go back to the homepage</html>"))); v.Interesting {
+			t.Errorf("status %d reported as a finding: %q", status, v.Reason)
+		}
+	}
+	if v := c.Classify("/", "/boom", fakeResp(500, []byte("<html>Internal error in handler</html>"))); !v.Interesting {
+		t.Errorf("a 500 on a guessed path should stay interesting, got %q", v.Reason)
+	}
+	// No baseline at all: a 404 is still boring, a 200 is not.
+	empty := NewCalibrator()
+	if v := empty.Classify("/x", "/x/a", fakeResp(404, []byte("nf"))); v.Interesting {
+		t.Errorf("uncalibrated 404 reported: %q", v.Reason)
+	}
+	if v := empty.Classify("/x", "/x/a", fakeResp(200, []byte("hi"))); !v.Interesting {
+		t.Errorf("uncalibrated 200 should be interesting")
+	}
+}
